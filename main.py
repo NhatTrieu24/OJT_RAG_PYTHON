@@ -4,7 +4,7 @@ import json
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-# ==================== CREDENTIALS – HOẠT ĐỘNG 100% VỚI SECRET FILE CỦA BẠN ====================
+# ==================== CREDENTIALS – DÙNG SECRET FILE CỦA RENDER ====================
 if os.path.exists("/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"):
     print("Đang dùng Secret File từ Render (GCP_SERVICE_ACCOUNT_JSON)")
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
@@ -38,9 +38,9 @@ def setup_rag():
         print("Tạo corpus mới:", DISPLAY_NAME)
         rag_corpus = rag.create_corpus(display_name=DISPLAY_NAME)
 
-    # Kiểm tra file đã import chưa
+    # Kiểm tra file đã import chưa (SỬA TỪ gcs_uri SANG uri)
     files = rag.list_files(rag_corpus.name)
-    if not any(f.gcs_uri == GCS_URI for f in files):
+    if not any(f.uri == GCS_URI for f in files):
         print("Đang import file PDF từ GCS (có thể mất 30-90s lần đầu)...")
         rag.import_files(
             corpus_name=rag_corpus.name,
