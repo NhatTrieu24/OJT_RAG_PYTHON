@@ -1,4 +1,4 @@
 fastapi
-uvicorn
-google-auth
-google-genai
+uvicorn[standard]
+google-cloud-aiplatform[preview]==1.68.0   # phiên bản mới nhất 2025 hỗ trợ RAG tốt nhất
+pydantic>=2.0
