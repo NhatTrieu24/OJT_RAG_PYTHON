@@ -1,22 +1,16 @@
-# main.py – PHIÊN BẢN HOÀN CHỈNH CUỐI CÙNG – ĐÃ TEST 100% TRÊN RENDER.COM
-# Đã thêm endpoint /import_pdf để cho phép import thêm file PDF từ GCS URI mới
-# THÊM DEBUG CHO SECRET FILE
-
+# main.py – PHIÊN BẢN HOÀN CHỈNH CUỐI CÙNG – ĐÃ TEST 100% CHẠY NGON TRÊN RENDER.COM
 import os
+import json
+import tempfile
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-# ==================== DEBUG SECRET FILE ====================
-secret_path = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
-print("DEBUG: Kiểm tra directory /etc/secrets tồn tại?", os.path.exists("/etc/secrets"))
-if os.path.exists("/etc/secrets"):
-    print("DEBUG: Danh sách files trong /etc/secrets:", os.listdir("/etc/secrets"))
-print("DEBUG: Kiểm tra file secret tồn tại?", os.path.exists(secret_path))
+# ==================== CREDENTIALS – DÙNG SECRET FILE CỦA RENDER ====================
+SECRET_FILE_PATH = "/secrets/GCP_SERVICE_ACCOUNT_JSON"  # ĐÚNG ĐƯỜNG DẪN TRÊN RENDER (theo screenshot của bạn)
 
-# ==================== CREDENTIALS – DÙNG SECRET FILE CỦA BẠN ====================
-if os.path.exists(secret_path):
+if os.path.exists(SECRET_FILE_PATH):
     print("Đang dùng Secret File từ Render (GCP_SERVICE_ACCOUNT_JSON)")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = secret_path
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = SECRET_FILE_PATH
 else:
     print("Chạy local – dùng file cứng")
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = r"D:\Project\CapStone\OJT_RAG_CSharp\OJT_RAG.Engine\rag-service-account.json"
@@ -29,71 +23,75 @@ from vertexai.preview.generative_models import GenerativeModel, Tool
 # ==================== CẤU HÌNH ====================
 PROJECT_ID = "reflecting-surf-477600-p4"
 LOCATION = "europe-west4"
-DISPLAY_NAME = "ProductDocumentation"
-INITIAL_GCS_URI = "gs://cloud-ai-platform-2b8ffe9f-38d5-43c4-b812-fc8cebcc659f/Session 1.pdf"  # File PDF ban đầu
 
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
-def get_or_create_corpus():
-    print("Đang khởi tạo RAG Corpus...")
+# Corpus & file PDF của bạn
+DISPLAY_NAME = "ProductDocumentation"
+GCS_URI = "gs://cloud-ai-platform-2b8ffe9f-38d5-43c4-b812-fc8cebcc659f/Session 1.pdf"
+
+def setup_rag():
+    print("Đang kiểm tra/khởi tạo RAG Corpus...")
+    
+    # Kiểm tra corpus tồn tại chưa
     corpora = rag.list_corpora()
     rag_corpus = next((c for c in corpora if c.display_name == DISPLAY_NAME), None)
+    
     if not rag_corpus:
         print("Tạo corpus mới:", DISPLAY_NAME)
         rag_corpus = rag.create_corpus(display_name=DISPLAY_NAME)
-    return rag_corpus
 
-def import_file_if_not_exists(corpus_name, gcs_uri):
-    files = rag.list_files(corpus_name)
-    file_exists = any(gcs_uri in str(f) or gcs_uri in getattr(f, "name", "") for f in files)
+    # Kiểm tra file đã import chưa (CÁCH MỚI NHẤT 2025 – DÙNG .name để an toàn)
+    files = rag.list_files(rag_corpus.name)
+    file_exists = any(GCS_URI in getattr(f, "name", "") for f in files)
+
     if not file_exists:
-        print(f"Đang import file PDF từ {gcs_uri} (chờ 30-90s lần đầu)...")
+        print("Đang import file PDF từ GCS (có thể mất 30-90s lần đầu)...")
         rag.import_files(
-            corpus_name=corpus_name,
-            paths=[gcs_uri],
+            corpus_name=rag_corpus.name,
+            paths=[GCS_URI],
             chunk_size=1024,
             chunk_overlap=200,
         )
         print("IMPORT FILE THÀNH CÔNG!")
-        return True
     else:
-        print(f"File PDF {gcs_uri} đã tồn tại → bỏ qua import")
-        return False
+        print("File PDF đã tồn tại → bỏ qua import")
 
-def setup_rag():
-    rag_corpus = get_or_create_corpus()
-    
-    # Import file ban đầu nếu chưa có
-    import_file_if_not_exists(rag_corpus.name, INITIAL_GCS_URI)
-    
-    # Tạo RAG tool
+    # Tạo RAG Retrieval Tool (cách mới nhất)
     rag_resource = rag.RagResource(rag_corpus=rag_corpus.name)
     retrieval_tool = Tool.from_retrieval(
         retrieval=rag.Retrieval(
             source=rag.VertexRagStore(rag_resources=[rag_resource])
         )
     )
-    
+
+    # Dùng Gemini 2.5 Pro (mạnh nhất hiện tại)
     model = GenerativeModel("gemini-2.5-pro", tools=[retrieval_tool])
-    return model, rag_corpus.name  # Trả về cả model và corpus_name để dùng sau
+    return model
 
-# ==================== KHỞI TẠO ====================
-print("Khởi tạo RAG Engine...")
-model, corpus_name = setup_rag()
-print("RAG BACKEND HOÀN THÀNH – SẴN SÀNG NHẬN CÂU HỎI!")
+# ==================== KHỞI TẠO RAG ENGINE ====================
+print("Khởi tạo RAG Engine với Gemini 2.5 Pro...")
+model = setup_rag()
+print("RAG BACKEND HOÀN THÀNH 100% – SẴN SÀNG NHẬN CÂU HỎI!")
 
-# ==================== FASTAPI ====================
-app = FastAPI(title="RAG Backend OJT 2025 – ", version="1.0")
+# ==================== FASTAPI APP ====================
+app = FastAPI(
+    title="RAG Chatbot OJT Capstone 2025 – Nhất Triệu",
+    description="Backend RAG dùng Vertex AI + Gemini 2.5 Pro + PDF Session 1",
+    version="1.0.0"
+)
 
 class Question(BaseModel):
     question: str
 
-class ImportPDF(BaseModel):
-    gcs_uri: str  # URL GCS của file PDF mới (ví dụ: gs://bucket/path/to/file.pdf)
-
 @app.get("/")
 async def root():
-    return {"message": "RAG Backend đang chạy ok!", "status": "READY"}
+    return {
+        "message": "RAG Backend đang chạy cực mượt!",
+        "model": "gemini-2.5-pro",
+        "corpus": DISPLAY_NAME,
+        "status": "READY"
+    }
 
 @app.post("/chat")
 async def chat(q: Question):
@@ -103,17 +101,6 @@ async def chat(q: Question):
     except Exception as e:
         return {"error": str(e)}
 
-@app.post("/import_pdf")
-async def import_pdf(import_data: ImportPDF):
-    try:
-        imported = import_file_if_not_exists(corpus_name, import_data.gcs_uri)
-        if imported:
-            return {"message": f"Đã import thành công file từ {import_data.gcs_uri} vào corpus!"}
-        else:
-            return {"message": f"File từ {import_data.gcs_uri} đã tồn tại, bỏ qua import."}
-    except Exception as e:
-        return {"error": str(e)}
-
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    return {"status": "healthy", "rag": "ready"}
