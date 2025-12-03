@@ -1,5 +1,5 @@
 # main.py – PHIÊN BẢN CUỐI CÙNG, CHẠY 100% TRÊN RENDER & LOCAL
-# ĐÃ FIX: secret file, fallback ngu, lỗi 401, lỗi file not found
+# ĐÃ FIX: secret file, fallback ngu, lỗi 401, lỗi file not found, model version
 
 import os
 from fastapi import FastAPI
@@ -76,12 +76,12 @@ def setup_rag():
         )
     )
 
-    # Dùng gemini-1.5-pro (ổn định hơn gemini-2.5-pro ở một số region)
-    model = GenerativeModel("gemini-1.5-pro", tools=[retrieval_tool])
+    # FIX: Dùng gemini-2.5-pro (GA, hỗ trợ đầy đủ ở europe-west4)
+    model = GenerativeModel("gemini-2.5-pro", tools=[retrieval_tool])
     return model
 
 # ==================== KHỞI TẠO RAG ====================
-print("Khởi tạo RAG Engine với Gemini 1.5 Pro...")
+print("Khởi tạo RAG Engine với Gemini 2.5 Pro...")
 model = setup_rag()
 print("RAG BACKEND HOÀN THÀNH 100% – SẴN SÀNG NHẬN CÂU HỎI!")
 
