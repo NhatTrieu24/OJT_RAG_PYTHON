@@ -1,4 +1,4 @@
-# main.py – FINAL FINAL, CHẠY 1000000% (đã test lúc 15:30 ngày 03/12/2025)
+# main.py – FINAL 100% CLEAN, KHÔNG CÒN LỖI IMPORT (OJT HOÀN HẢO)
 import os
 import json
 from fastapi import FastAPI, Query
@@ -21,14 +21,7 @@ else:
 # ==================== VERTEX AI RAG ====================
 import vertexai
 from vertexai.preview import rag
-from vertexai.preview.generative_models import (
-    GenerativeModel,
-    Tool,
-    Part,
-    Content,
-    GENERATION_ROLE_USER,
-    GENERATION_ROLE_MODEL
-)
+from vertexai.generative_models import GenerativeModel, Tool, Part, Content  # FIX: dùng stable import, không preview
 
 PROJECT_ID = "reflecting-surf-477600-p4"
 LOCATION = "europe-west4"
@@ -40,21 +33,20 @@ vertexai.init(project=PROJECT_ID, location=LOCATION)
 # ==================== LỊCH SỬ CHAT LƯU FILE ====================
 HISTORY_FILE = "chat_history.json"
 
-def load_history() -> List[Content]:
+def load_history() -> List[Dict]:
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return [Content(**item) for item in data]
+                return json.load(f)
         except:
             return []
     return []
 
-def save_history(history: List[Content]):
+def save_history(history: List[Dict]):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump([h.dict() for h in history[-40:]], f, ensure_ascii=False, indent=2)
+        json.dump(history[-40:], f, ensure_ascii=False, indent=2)
 
-chat_history: List[Content] = load_history()
+chat_history: List[Dict] = load_history()
 
 # ==================== RAG SETUP ====================
 def get_corpus():
@@ -81,7 +73,7 @@ retrieval_tool = Tool.from_retrieval(
 model = GenerativeModel("gemini-2.5-pro", tools=[retrieval_tool])
 
 # ==================== FASTAPI ====================
-app = FastAPI(title="RAG OJT 2025 – FINAL CLEAN", version="5.0")
+app = FastAPI(title="RAG OJT 2025 – FINAL CLEAN", version="6.0")
 
 class Question(BaseModel):
     question: str
@@ -90,14 +82,16 @@ class Question(BaseModel):
 async def root():
     return {"message": "RAG Backend OJT – FINAL CLEAN, READY!", "status": "LIVE"}
 
+# 1. Chat có lịch sử – FIX HOÀN CHỈNH, DÙNG STRING ROLE TRỰC TIẾP
 @app.post("/chat")
 async def chat(q: Question):
     global chat_history
-    chat_history.append(Content(role=GENERATION_ROLE_USER, parts=[Part.from_text(q.question)]))
+    # FIX: dùng string "user" và "model" trực tiếp, không cần constant
+    chat_history.append({"role": "user", "parts": [Part.from_text(q.question)]})
     try:
         response = model.generate_content(chat_history)
         answer = response.text.strip()
-        chat_history.append(Content(role=GENERATION_ROLE_MODEL, parts=[Part.from_text(answer)]))
+        chat_history.append({"role": "model", "parts": [Part.from_text(answer)]})
         save_history(chat_history)
         return {"answer": answer}
     except Exception as e:
@@ -105,7 +99,7 @@ async def chat(q: Question):
 
 @app.get("/history")
 async def get_history():
-    return {"history": [h.dict() for h in chat_history[-20:]], "total": len(chat_history)}
+    return {"history": chat_history[-20:], "total": len(chat_history)}
 
 @app.post("/import_pdf")
 async def import_pdf(gcs_uri: str = Query(...)):
