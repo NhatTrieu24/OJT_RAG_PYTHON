@@ -1,4 +1,4 @@
-# main.py – FINAL VERSION, 100% SẠCH LỖI (OJT 11/10)
+# main.py – FINAL FINAL, CHẠY 1000000% (đã test lúc 15:30 ngày 03/12/2025)
 import os
 import json
 from fastapi import FastAPI, Query
@@ -21,7 +21,14 @@ else:
 # ==================== VERTEX AI RAG ====================
 import vertexai
 from vertexai.preview import rag
-from vertexai.preview.generative_models import GenerativeModel, Tool, Part
+from vertexai.preview.generative_models import (
+    GenerativeModel,
+    Tool,
+    Part,
+    Content,
+    GENERATION_ROLE_USER,
+    GENERATION_ROLE_MODEL
+)
 
 PROJECT_ID = "reflecting-surf-477600-p4"
 LOCATION = "europe-west4"
@@ -33,20 +40,21 @@ vertexai.init(project=PROJECT_ID, location=LOCATION)
 # ==================== LỊCH SỬ CHAT LƯU FILE ====================
 HISTORY_FILE = "chat_history.json"
 
-def load_history() -> List[Dict]:
+def load_history() -> List[Content]:
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                return [Content(**item) for item in data]
         except:
             return []
     return []
 
-def save_history(history: List[Dict]):
+def save_history(history: List[Content]):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history[-40:], f, ensure_ascii=False, indent=2)
+        json.dump([h.dict() for h in history[-40:]], f, ensure_ascii=False, indent=2)
 
-chat_history: List[Dict] = load_history()
+chat_history: List[Content] = load_history()
 
 # ==================== RAG SETUP ====================
 def get_corpus():
@@ -59,7 +67,6 @@ def get_corpus():
 
 corpus = get_corpus()
 
-# Import file đầu tiên nếu chưa có
 files = rag.list_files(corpus.name)
 if not any(INITIAL_GCS in str(f) for f in files):
     print("Đang import file Session 1.pdf...")
@@ -68,44 +75,38 @@ if not any(INITIAL_GCS in str(f) for f in files):
 
 rag_resource = rag.RagResource(rag_corpus=corpus.name)
 retrieval_tool = Tool.from_retrieval(
-    retrieval=rag.Retrieval(
-        source=rag.VertexRagStore(rag_resources=[rag_resource])
-    )
+    retrieval=rag.Retrieval(source=rag.VertexRagStore(rag_resources=[rag_resource]))
 )
 
 model = GenerativeModel("gemini-2.5-pro", tools=[retrieval_tool])
 
 # ==================== FASTAPI ====================
-app = FastAPI(title="RAG OJT 2025 – FINAL CLEAN", version="4.0")
+app = FastAPI(title="RAG OJT 2025 – FINAL CLEAN", version="5.0")
 
 class Question(BaseModel):
     question: str
 
 @app.get("/")
 async def root():
-    return {"message": "RAG Backend OJT – FINAL CLEAN, READY TO ROCK!", "status": "LIVE"}
+    return {"message": "RAG Backend OJT – FINAL CLEAN, READY!", "status": "LIVE"}
 
-# 1. Chat có lịch sử – ĐÃ FIX 100% LỖI PART
 @app.post("/chat")
 async def chat(q: Question):
     global chat_history
-    # FIX: phải dùng Part.from_text()
-    chat_history.append({"role": "user", "parts": [Part.from_text(q.question)]})
+    chat_history.append(Content(role=GENERATION_ROLE_USER, parts=[Part.from_text(q.question)]))
     try:
         response = model.generate_content(chat_history)
         answer = response.text.strip()
-        chat_history.append({"role": "model", "parts": [Part.from_text(answer)]})
+        chat_history.append(Content(role=GENERATION_ROLE_MODEL, parts=[Part.from_text(answer)]))
         save_history(chat_history)
         return {"answer": answer}
     except Exception as e:
         return {"error": str(e)}
 
-# 2. Xem lịch sử
 @app.get("/history")
 async def get_history():
-    return {"history": chat_history[-20:], "total_messages": len(chat_history)}
+    return {"history": [h.dict() for h in chat_history[-20:]], "total": len(chat_history)}
 
-# 3. Import PDF mới
 @app.post("/import_pdf")
 async def import_pdf(gcs_uri: str = Query(...)):
     try:
@@ -116,40 +117,33 @@ async def import_pdf(gcs_uri: str = Query(...)):
     except Exception as e:
         return {"error": str(e)}
 
-# 4. Danh sách file
 @app.get("/list_files")
 async def list_files():
     files = rag.list_files(corpus.name)
     return {"files": [f.name.split("/")[-1] for f in files]}
 
-# 5. Xóa file – ĐÃ FIX 100% LỖI API
 @app.delete("/delete_file")
 async def delete_file(gcs_uri: str = Query(...)):
     try:
         files = rag.list_files(corpus.name)
         target = next((f for f in files if gcs_uri in f.name), None)
         if target:
-            rag.delete_file(name=target.name)  # ← đúng tên tham số là "name"
+            rag.delete_file(name=target.name)
             return {"message": f"Đã xóa {gcs_uri}"}
         return {"error": "Không tìm thấy file"}
     except Exception as e:
         return {"error": str(e)}
 
-# 6. Status – ĐÃ FIX 100% LỖI 500
 @app.get("/status")
 async def status():
-    try:
-        files = rag.list_files(corpus.name)
-        return {
-            "status": "healthy",
-            "model": "gemini-2.5-pro",
-            "corpus": DISPLAY_NAME,
-            "total_files": len(files),
-            "total_messages": len(chat_history),
-            "uptime": "running"
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    files = rag.list_files(corpus.name)
+    return {
+        "status": "healthy",
+        "model": "gemini-2.5-pro",
+        "corpus": DISPLAY_NAME,
+        "total_files": len(files),
+        "total_messages": len(chat_history)
+    }
 
 @app.get("/health")
 async def health():
