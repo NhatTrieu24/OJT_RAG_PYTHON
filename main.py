@@ -81,14 +81,14 @@ retrieval_tool = Tool.from_retrieval(
 model = GenerativeModel("gemini-2.5-pro", tools=[retrieval_tool])
 
 # ==================== FASTAPI ====================
-app = FastAPI(title="RAG OJT 2025 – HOÀN HẢO", version="7.0")
+app = FastAPI(title="RAG OJT 2025", version="7.0")
 
 class Question(BaseModel):
     question: str
 
 @app.get("/")
 async def root():
-    return {"message": "RAG Backend OJT – HOÀN HẢO, SẴN SÀNG!", "status": "LIVE"}
+    return {"message": "RAG Backend OJT ", "status": "LIVE"}
 
 # CHAT CÓ LỊCH SỬ – 100% HOẠT ĐỘNG
 @app.post("/chat")
