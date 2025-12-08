@@ -1,7 +1,8 @@
-# main.py – FINAL 100% HOÀN HẢO, CHẠY NGON NGAY TRÊN RENDER
+# main.py – FINAL + CORS FIX 100% (CHO C# GỌI ĐƯỢC NGAY)
 import os
 import json
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware  # THÊM DÒNG NÀY
 from pydantic import BaseModel
 from typing import List
 
@@ -30,7 +31,19 @@ INITIAL_GCS = "gs://cloud-ai-platform-2b8ffe9f-38d5-43c4-b812-fc8cebcc659f/Sessi
 
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
-# ==================== LỊCH SỬ CHAT (dùng Content object thật) ====================
+# ==================== CORS – CHO PHÉP C# GỌI API ====================
+app = FastAPI(title="RAG OJT 2025 – FINAL + CORS", version="8.0")
+
+# FIX CORS – CHO PHÉP TẤT CẢ (local + production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Production: thay bằng domain C# khi deploy
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==================== LỊCH SỬ CHAT ====================
 HISTORY_FILE = "chat_history.json"
 
 def load_history() -> List[Content]:
@@ -39,8 +52,7 @@ def load_history() -> List[Content]:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return [Content(**item) for item in data]
-        except Exception as e:
-            print("Lỗi load history:", e)
+        except:
             return []
     return []
 
@@ -48,17 +60,12 @@ def save_history(history: List[Content]):
     try:
         serializable = []
         for c in history[-40:]:
-            parts = []
-            for p in c.parts:
-                if hasattr(p, "text"):
-                    parts.append({"text": p.text})
-                elif hasattr(p, "_raw_part"):
-                    parts.append({"text": p._raw_part.text})
+            parts = [{"text": p.text} if hasattr(p, "text") else {"text": p._raw_part.text} for p in c.parts]
             serializable.append({"role": c.role, "parts": parts})
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False, indent=2)
     except:
-        pass  # không crash nếu lỗi lưu
+        pass
 
 chat_history: List[Content] = load_history()
 
@@ -80,28 +87,23 @@ retrieval_tool = Tool.from_retrieval(
 
 model = GenerativeModel("gemini-2.5-pro", tools=[retrieval_tool])
 
-# ==================== FASTAPI ====================
-app = FastAPI(title="RAG OJT 2025", version="7.0")
-
+# ==================== API ====================
 class Question(BaseModel):
     question: str
 
 @app.get("/")
 async def root():
-    return {"message": "RAG Backend OJT ", "status": "LIVE"}
+    return {"message": "RAG Backend OJT – ĐÃ FIX CORS, SẴN SÀNG CHO C#!", "status": "LIVE"}
 
-# CHAT CÓ LỊCH SỬ – 100% HOẠT ĐỘNG
 @app.post("/chat")
 async def chat(q: Question):
     global chat_history
     user_content = Content(role="user", parts=[Part.from_text(q.question)])
     chat_history.append(user_content)
-    
     try:
         response = model.generate_content(chat_history)
         answer = response.text.strip()
-        bot_content = Content(role="model", parts=[Part.from_text(answer)])
-        chat_history.append(bot_content)
+        chat_history.append(Content(role="model", parts=[Part.from_text(answer)]))
         save_history(chat_history)
         return {"answer": answer}
     except Exception as e:
@@ -109,7 +111,7 @@ async def chat(q: Question):
 
 @app.get("/history")
 async def get_history():
-    return {"total": len(chat_history), "last_5": [c.role + ": " + c.parts[0].text[:100] for c in chat_history[-10:]]}
+    return {"total": len(chat_history)}
 
 @app.post("/import_pdf")
 async def import_pdf(gcs_uri: str = Query(...)):
@@ -139,9 +141,8 @@ async def delete_file(gcs_uri: str = Query(...)):
 @app.get("/status")
 async def status():
     return {
-        "status": "HOÀN HẢO",
+        "status": "HOÀN HẢO + CORS FIX",
         "model": "gemini-2.5-pro",
-        "corpus": DISPLAY_NAME,
-        "files": len(list(rag.list_files(corpus.name))),
-        "messages": len(chat_history)
+        "total_files": len(list(rag.list_files(corpus.name))),
+        "total_messages": len(chat_history)
     }
