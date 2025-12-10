@@ -1,10 +1,10 @@
-# main.py – FINAL + HIỂN THỊ TÊN FILE ĐẸP + CORS FIX
+# main.py – FINAL 100% HOÀN HẢO, HIỂN THỊ TÊN FILE ĐẸP + CORS FIX
 import os
 import json
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict
+from typing import List
 
 # ==================== CREDENTIALS ====================
 secret_path = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
@@ -92,7 +92,7 @@ class Question(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"message": "RAG Backend OJT", "status": "LIVE"}
+    return {"message": "RAG Backend OJT ", "status": "LIVE"}
 
 @app.post("/chat")
 async def chat(q: Question):
@@ -118,7 +118,8 @@ async def import_pdf(gcs_uri: str = Query(...)):
         if any(gcs_uri in str(f) for f in rag.list_files(corpus.name)):
             return {"message": "File đã tồn tại"}
         rag.import_files(corpus.name, paths=[gcs_uri])
-        return {"message": f"Import thành công: {gcs_uri.split('/')[-1]}"}
+        file_name = gcs_uri.split("/")[-1]  # tên file thật
+        return {"message": f"Import thành công: {file_name}"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -128,11 +129,18 @@ async def list_files():
     files = rag.list_files(corpus.name)
     result = []
     for f in files:
-        # Lấy tên file thật từ URI (phần cuối cùng sau /)
-        name = f.name.split("/")[-1] if "/" in f.name else f.name
+        # Lấy tên file thật từ URI (phần cuối cùng sau dấu /)
+        full_uri = f.name if f.name.startswith("gs://") else f.name
+        file_name = full_uri.split("/")[-1]  # ví dụ: "Session 1.pdf"
+        
         # Nếu tên file có đuôi .pdf thì đẹp hơn
-        display_name = name if name.endswith(".pdf") else f"File {name[:12]}..."
+        if file_name.endswith(".pdf") or file_name.endswith(".docx") or file_name.endswith(".txt"):
+            display_name = file_name
+        else:
+            display_name = f"File {file_name[:20]}..."  # cắt ngắn nếu ID dài
+        
         result.append(display_name)
+    
     return {"files": result}
 
 @app.delete("/delete_file")
