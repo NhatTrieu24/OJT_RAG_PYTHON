@@ -1,6 +1,5 @@
-# main.py – FINAL 100% HOÀN HẢO, HIỂN THỊ TÊN FILE ĐẸP + CORS FIX
+# main.py – FINAL CLEAN (KHÔNG CÒN FILE CŨ, CHỈ DÙNG FILE BẠN ĐÃ THÊM)
 import os
-import json
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -27,12 +26,11 @@ from vertexai.generative_models import GenerativeModel, Tool, Part, Content
 PROJECT_ID = "reflecting-surf-477600-p4"
 LOCATION = "europe-west4"
 DISPLAY_NAME = "ProductDocumentation"
-INITIAL_GCS = "gs://cloud-ai-platform-2b8ffe9f-38d5-43c4-b812-fc8cebcc659f/Session 1.pdf"
 
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
 # ==================== CORS ====================
-app = FastAPI(title="RAG OJT 2025 – TÊN FILE ĐẸP", version="10.0")
+app = FastAPI(title="RAG OJT 2025 – FINAL CLEAN", version="12.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,43 +40,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== LỊCH SỬ CHAT ====================
-HISTORY_FILE = "chat_history.json"
+# ==================== RAG SETUP (KHÔNG CÒN FILE CŨ) ====================
+def get_corpus():
+    corpora = rag.list_corpora()
+    corpus = next((c for c in corpora if c.display_name == DISPLAY_NAME), None)
+    if not corpus:
+        print("Tạo corpus mới...")
+        corpus = rag.create_corpus(display_name=DISPLAY_NAME)
+    return corpus
 
-def load_history() -> List[Content]:
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return [Content(**item) for item in data]
-        except:
-            return []
-    return []
+corpus = get_corpus()
 
-def save_history(history: List[Content]):
-    try:
-        serializable = []
-        for c in history[-40:]:
-            parts = [{"text": p.text} if hasattr(p, "text") else {"text": p._raw_part.text} for p in c.parts]
-            serializable.append({"role": c.role, "parts": parts})
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
-    except:
-        pass
-
-chat_history: List[Content] = load_history()
-
-# ==================== RAG SETUP ====================
-corpus = next((c for c in rag.list_corpora() if c.display_name == DISPLAY_NAME), None)
-if not corpus:
-    print("Tạo corpus mới...")
-    corpus = rag.create_corpus(display_name=DISPLAY_NAME)
-
-files = rag.list_files(corpus.name)
-if not any(INITIAL_GCS in str(f) for f in files):
-    print("Import file Session 1.pdf...")
-    rag.import_files(corpus.name, paths=[INITIAL_GCS])
-
+# KHÔNG CÒN import file cũ nữa – chỉ dùng file bạn đã thêm
 rag_resource = rag.RagResource(rag_corpus=corpus.name)
 retrieval_tool = Tool.from_retrieval(
     retrieval=rag.Retrieval(source=rag.VertexRagStore(rag_resources=[rag_resource]))
@@ -92,25 +65,27 @@ class Question(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"message": "RAG Backend OJT ", "status": "LIVE"}
+    return {"message": "RAG Backend OJT – ĐÃ XÓA FILE CŨ, CHỈ DÙNG FILE MỚI", "status": "LIVE"}
 
 @app.post("/chat")
 async def chat(q: Question):
-    global chat_history
-    user_content = Content(role="user", parts=[Part.from_text(q.question)])
-    chat_history.append(user_content)
     try:
-        response = model.generate_content(chat_history)
-        answer = response.text.strip()
-        chat_history.append(Content(role="model", parts=[Part.from_text(answer)]))
-        save_history(chat_history)
-        return {"answer": answer}
+        response = model.generate_content(q.question)
+        return {"answer": response.text.strip()}
     except Exception as e:
         return {"error": str(e)}
 
-@app.get("/history")
-async def get_history():
-    return {"total": len(chat_history)}
+@app.get("/list_files")
+async def list_files():
+    files = rag.list_files(corpus.name)
+    result = []
+    for f in files:
+        # Lấy tên file thật từ URI (phần cuối cùng sau /)
+        full_uri = f.name if f.name.startswith("gs://") else f.name
+        file_name = full_uri.split("/")[-1]
+        display_name = file_name if file_name.endswith((".pdf", ".docx", ".txt")) else f"File {file_name[:15]}..."
+        result.append(display_name)
+    return {"files": result}
 
 @app.post("/import_pdf")
 async def import_pdf(gcs_uri: str = Query(...)):
@@ -118,30 +93,10 @@ async def import_pdf(gcs_uri: str = Query(...)):
         if any(gcs_uri in str(f) for f in rag.list_files(corpus.name)):
             return {"message": "File đã tồn tại"}
         rag.import_files(corpus.name, paths=[gcs_uri])
-        file_name = gcs_uri.split("/")[-1]  # tên file thật
+        file_name = gcs_uri.split("/")[-1]
         return {"message": f"Import thành công: {file_name}"}
     except Exception as e:
         return {"error": str(e)}
-
-# FIX: HIỂN THỊ TÊN FILE ĐẸP (lấy trực tiếp từ URI)
-@app.get("/list_files")
-async def list_files():
-    files = rag.list_files(corpus.name)
-    result = []
-    for f in files:
-        # Lấy tên file thật từ URI (phần cuối cùng sau dấu /)
-        full_uri = f.name if f.name.startswith("gs://") else f.name
-        file_name = full_uri.split("/")[-1]  # ví dụ: "Session 1.pdf"
-        
-        # Nếu tên file có đuôi .pdf thì đẹp hơn
-        if file_name.endswith(".pdf") or file_name.endswith(".docx") or file_name.endswith(".txt"):
-            display_name = file_name
-        else:
-            display_name = f"File {file_name[:20]}..."  # cắt ngắn nếu ID dài
-        
-        result.append(display_name)
-    
-    return {"files": result}
 
 @app.delete("/delete_file")
 async def delete_file(gcs_uri: str = Query(...)):
@@ -156,10 +111,15 @@ async def delete_file(gcs_uri: str = Query(...)):
 
 @app.get("/status")
 async def status():
+    files = rag.list_files(corpus.name)
     return {
         "status": "HOÀN HẢO",
         "model": "gemini-2.5-pro",
         "corpus": DISPLAY_NAME,
-        "total_files": len(list(rag.list_files(corpus.name))),
-        "total_messages": len(chat_history)
+        "total_files": len(files),
+        "files": [f.name.split("/")[-1] for f in files]
     }
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
