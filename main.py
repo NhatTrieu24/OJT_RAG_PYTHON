@@ -1,10 +1,10 @@
-# main.py – FINAL + CORS FIX 100% (CHO C# GỌI ĐƯỢC NGAY)
+# main.py – FINAL + HIỂN THỊ TÊN FILE ĐẸP + CORS FIX
 import os
 import json
 from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware  # THÊM DÒNG NÀY
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Dict
 
 # ==================== CREDENTIALS ====================
 secret_path = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
@@ -31,43 +31,23 @@ INITIAL_GCS = "gs://cloud-ai-platform-2b8ffe9f-38d5-43c4-b812-fc8cebcc659f/Sessi
 
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
-# ==================== CORS – CHO PHÉP C# GỌI API ====================
-app = FastAPI(title="RAG OJT 2025 – FINAL + CORS", version="8.0")
+# ==================== LƯU TÊN FILE (mapping GCS URI → tên thật) ====================
+FILE_MAPPING_FILE = "file_mapping.json"
 
-# FIX CORS – CHO PHÉP TẤT CẢ (local + production)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Production: thay bằng domain C# khi deploy
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ==================== LỊCH SỬ CHAT ====================
-HISTORY_FILE = "chat_history.json"
-
-def load_history() -> List[Content]:
-    if os.path.exists(HISTORY_FILE):
+def load_file_mapping() -> Dict[str, str]:
+    if os.path.exists(FILE_MAPPING_FILE):
         try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return [Content(**item) for item in data]
+            with open(FILE_MAPPING_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
         except:
-            return []
-    return []
+            return {}
+    return {}
 
-def save_history(history: List[Content]):
-    try:
-        serializable = []
-        for c in history[-40:]:
-            parts = [{"text": p.text} if hasattr(p, "text") else {"text": p._raw_part.text} for p in c.parts]
-            serializable.append({"role": c.role, "parts": parts})
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(serializable, f, ensure_ascii=False, indent=2)
-    except:
-        pass
+def save_file_mapping(mapping: Dict[str, str]):
+    with open(FILE_MAPPING_FILE, "w", encoding="utf-8") as f:
+        json.dump(mapping, f, ensure_ascii=False, indent=2)
 
-chat_history: List[Content] = load_history()
+file_mapping: Dict[str, str] = load_file_mapping()
 
 # ==================== RAG SETUP ====================
 corpus = next((c for c in rag.list_corpora() if c.display_name == DISPLAY_NAME), None)
@@ -75,17 +55,26 @@ if not corpus:
     print("Tạo corpus mới...")
     corpus = rag.create_corpus(display_name=DISPLAY_NAME)
 
+# Import file đầu tiên + lưu tên thật
 files = rag.list_files(corpus.name)
 if not any(INITIAL_GCS in str(f) for f in files):
-    print("Import file đầu tiên...")
+    print("Import file Session 1.pdf...")
     rag.import_files(corpus.name, paths=[INITIAL_GCS])
+    # Lưu tên file gốc (tên file trong GCS)
+    file_name = INITIAL_GCS.split("/")[-1]
+    file_mapping[INITIAL_GCS] = file_name
+    save_file_mapping(file_mapping)
 
-rag_resource = rag.RagResource(rag_corpus=corpus.name)
-retrieval_tool = Tool.from_retrieval(
-    retrieval=rag.Retrieval(source=rag.VertexRagStore(rag_resources=[rag_resource]))
+# ==================== CORS ====================
+app = FastAPI(title="RAG OJT 2025 – HIỂN THỊ TÊN FILE ĐẸP", version="9.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
-model = GenerativeModel("gemini-2.5-pro", tools=[retrieval_tool])
 
 # ==================== API ====================
 class Question(BaseModel):
@@ -93,7 +82,7 @@ class Question(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"message": "RAG Backend OJT – ĐÃ FIX CORS, SẴN SÀNG CHO C#!", "status": "LIVE"}
+    return {"message": "RAG Backend OJT – ĐÃ HIỂN THỊ TÊN FILE ĐẸP!", "status": "LIVE"}
 
 @app.post("/chat")
 async def chat(q: Question):
@@ -119,13 +108,23 @@ async def import_pdf(gcs_uri: str = Query(...)):
         if any(gcs_uri in str(f) for f in rag.list_files(corpus.name)):
             return {"message": "File đã tồn tại"}
         rag.import_files(corpus.name, paths=[gcs_uri])
-        return {"message": f"Import thành công: {gcs_uri}"}
+        # Lưu tên file thật
+        file_name = gcs_uri.split("/")[-1]
+        file_mapping[gcs_uri] = file_name
+        save_file_mapping(file_mapping)
+        return {"message": f"Import thành công: {file_name}"}
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/list_files")
 async def list_files():
-    return {"files": [f.name.split("/")[-1] for f in rag.list_files(corpus.name)]}
+    files = rag.list_files(corpus.name)
+    result = []
+    for f in files:
+        gcs_uri = f.name.split("gs://")[-1] if "gs://" in f.name else f.name
+        display_name = file_mapping.get(gcs_uri, gcs_uri.split("/")[-1])
+        result.append(display_name)
+    return {"files": result}
 
 @app.delete("/delete_file")
 async def delete_file(gcs_uri: str = Query(...)):
@@ -133,16 +132,21 @@ async def delete_file(gcs_uri: str = Query(...)):
         target = next((f for f in rag.list_files(corpus.name) if gcs_uri in f.name), None)
         if target:
             rag.delete_file(name=target.name)
-            return {"message": "Đã xóa"}
-        return {"error": "Không tìm thấy"}
+            # Xóa khỏi mapping
+            if gcs_uri in file_mapping:
+                del file_mapping[gcs_uri]
+                save_file_mapping(file_mapping)
+            return {"message": f"Đã xóa {gcs_uri}"}
+        return {"error": "Không tìm thấy file"}
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/status")
 async def status():
     return {
-        "status": "HOÀN HẢO + CORS FIX",
+        "status": "HOÀN HẢO",
         "model": "gemini-2.5-pro",
+        "corpus": DISPLAY_NAME,
         "total_files": len(list(rag.list_files(corpus.name))),
         "total_messages": len(chat_history)
     }
