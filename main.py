@@ -33,19 +33,25 @@ vertexai.init(project=PROJECT_ID, location=LOCATION)
 app = FastAPI(title="RAG OJT 2025 – FINAL CLEAN", version="12.0")
 
 
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origins=[
+#         "http://localhost:3000",
+#         "http://127.0.0.1:3000",
+#         "https://frontend-ojt-544c.vercel.app"
+#     ],
+#     allow_origin_regex=r"https://frontend-ojt-544c-.*\.vercel\.app",
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://frontend-ojt-544c.vercel.app"
-    ],
-    allow_origin_regex=r"https://frontend-ojt-544c-.*\.vercel\.app",
-    allow_credentials=True,
+    allow_origins=["*"], 
+    allow_credentials=False,           
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ==================== RAG SETUP (KHÔNG CÒN FILE CŨ) ====================
 def get_corpus():
     corpora = rag.list_corpora()
