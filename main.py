@@ -38,9 +38,9 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "https://frontend-ojt-544c.vercel.app", 
-        "https://frontend-ojt-544c-nsxb7l5w1-hudyangs-projects.vercel.app/#/ojt"
+        "https://frontend-ojt-544c.vercel.app"
     ],
+    allow_origin_regex=r"https://frontend-ojt-544c-.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
