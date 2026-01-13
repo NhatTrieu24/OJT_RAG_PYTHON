@@ -39,6 +39,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "https://frontend-ojt-544c.vercel.app", 
+        "https://frontend-ojt-544c-nsxb7l5w1-hudyangs-projects.vercel.app/#/ojt"
     ],
     allow_credentials=True,
     allow_methods=["*"],
