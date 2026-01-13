@@ -34,7 +34,7 @@ app = FastAPI(title="RAG OJT 2025 – FINAL CLEAN", version="12.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -65,7 +65,7 @@ class Question(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"message": "RAG Backend OJT – ĐÃ XÓA FILE CŨ, CHỈ DÙNG FILE MỚI", "status": "LIVE"}
+    return {"message": "RAG Backend OJT ", "status": "LIVE"}
 
 @app.post("/chat")
 async def chat(q: Question):

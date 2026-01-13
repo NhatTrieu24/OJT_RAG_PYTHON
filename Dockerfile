@@ -1,19 +1,18 @@
-# Dockerfile
+# Use an official lightweight Python image
 FROM python:3.11-slim
 
-# Tạo working dir
+# Set working directory
 WORKDIR /app
 
-# Copy requirements
-COPY requirements.txt /app/requirements.txt
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential git curl && \
-    python -m pip install --upgrade pip && \
-    pip install -r /app/requirements.txt && \
-    apt-get remove -y build-essential && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
+# Copy app files
+COPY . .
 
-COPY . /app
+# Expose FastAPI default port
+EXPOSE 8080
 
-# Entry point sẽ xét credential từ SECRET env (xem phần SECRET)
-ENTRYPOINT ["python", "main.py"]
+# Command for Cloud Run or local run
+CMD exec uvicorn main:app --host 0.0.0.0 --port 8080
