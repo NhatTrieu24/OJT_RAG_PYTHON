@@ -71,6 +71,12 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+@app.middleware("http")
+async def debug_origin(request, call_next): 
+    print("METHOD:", request.method)
+    print("ORIGIN:", request.headers.get("origin"))
+    return await call_next(request)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
