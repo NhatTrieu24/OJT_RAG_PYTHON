@@ -5,19 +5,31 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
+from google.cloud import storage
 
 # ==================== CREDENTIALS ====================
-secret_path = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
-if os.path.exists(secret_path) and os.path.getsize(secret_path) > 0:
-    print("Render detect secret file → dùng secret từ Render")
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = secret_path
+# 1. Đường dẫn trên Render (Secret File)
+render_secret_path = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
+
+# 2. Đường dẫn local (Cùng thư mục với main.py)
+local_key_file = "rag-service-account.json" 
+
+if os.path.exists(render_secret_path):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = render_secret_path
+    print("--- Chạy trên Deploy: Đã load Secret File ---")
+
+elif os.path.exists(local_key_file):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(local_key_file)
+    print(f"--- Chạy Local: Đã load file {local_key_file} ---")
+
 else:
-    local_path = os.path.expanduser("~/rag-service-account.json")
-    if os.path.exists(local_path):
-        print("Local → dùng file key ở home")
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = local_path
-    else:
-        raise FileNotFoundError("Thiếu GCP_SERVICE_ACCOUNT_JSON secret!")
+    # Nếu không thấy file nào, kiểm tra xem biến môi trường GOOGLE_APPLICATION_CREDENTIALS đã có chưa
+    if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+        raise FileNotFoundError(
+            "KHÔNG TÌM THẤY CREDENTIALS! \n"
+            "Vui lòng để file 'rag-service-account.json' vào thư mục project."
+        )
+    print("--- Chạy Local: Sử dụng biến môi trường hệ thống ---")
 
 # ==================== VERTEX AI IMPORTS ====================
 import vertexai
@@ -126,12 +138,23 @@ async def list_files():
         files = get_files_list()
         result = []
         for f in files:
-            full_uri = f.name if f.name.startswith("gs://") else f.name
-            file_name = full_uri.split("/")[-1]
-            display_name = file_name if file_name.endswith((".pdf", ".docx", ".txt")) else f"File {file_name[:15]}..."
-            result.append(display_name)
+            # Khởi tạo gcs_uri mặc định là N/A
+            gcs_uri = "N/A"
+            
+            # Kiểm tra cấu trúc file_spec.gcs_source.uri (Cách Vertex AI RAG lưu)
+            if hasattr(f, 'file_spec') and f.file_spec.gcs_source:
+                gcs_uri = f.file_spec.gcs_source.uri
+            
+            result.append({
+                "display_name": f.display_name,
+                "gcs_uri": gcs_uri,
+                "resource_name": f.name # Đây là cái projects/.../ragFiles/...
+            })
         return {"files": result}
     except Exception as e:
+        # Nếu vẫn lỗi, in toàn bộ đối tượng ra console để debug
+        if files and len(files) > 0:
+            print(f"DEBUG - Cấu trúc file mẫu: {files[0]}")
         raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}")
 
 @app.post("/chat")
@@ -158,14 +181,44 @@ async def import_pdf(gcs_uri: str = Query(...)):
         raise HTTPException(status_code=500, detail=f"Import error: {str(e)}")
 
 @app.delete("/delete_file")
-async def delete_file(gcs_uri: str = Query(...)):
+async def delete_file(
+    gcs_uri: Optional[str] = Query(None), 
+    resource_name: Optional[str] = Query(None)
+):
+    """
+    Xóa file: Ưu tiên xóa theo resource_name nếu có, 
+    nếu không sẽ tìm theo gcs_uri.
+    """
     try:
-        files = get_files_list()
-        target = next((f for f in files if gcs_uri in f.name), None)
-        if target:
-            rag.delete_file(name=target.name)
-            return {"message": f"Đã xóa {gcs_uri.split('/')[-1]}"}
-        return {"error": "Không tìm thấy file"}
+        target_name = None
+
+        # 1. Tìm ID của file trong Vertex AI
+        if resource_name:
+            target_name = resource_name
+        elif gcs_uri:
+            files = get_files_list()
+            target = next((f for f in files if gcs_uri in str(f)), None)
+            if target:
+                target_name = target.name
+        
+        if not target_name:
+            return {"error": "Không tìm thấy file để xóa. Vui lòng cung cấp resource_name chính xác."}
+
+        # 2. Xóa khỏi Vertex AI Corpus
+        rag.delete_file(name=target_name)
+        
+        # 3. Xóa file vật lý trên GCS (Nếu bạn có gcs_uri)
+        if gcs_uri and gcs_uri.startswith("gs://"):
+            try:
+                path_parts = gcs_uri.replace("gs://", "").split("/", 1)
+                storage_client = storage.Client()
+                storage_client.bucket(path_parts[0]).blob(path_parts[1]).delete()
+                print(f"Đã xóa GCS: {gcs_uri}")
+            except Exception as e_gcs:
+                print(f"GCS Delete Skip: {e_gcs}")
+
+        return {"message": f"Đã xóa thành công file: {target_name}"}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
 
