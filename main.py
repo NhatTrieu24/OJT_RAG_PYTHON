@@ -1,11 +1,20 @@
-# main.py – FINAL CLEAN & FIXED (Vertex AI Pager + Lifespan + Error Handling)
+from ast import List
 import os
+import vertexai
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
 from google.cloud import storage
+from vertexai.preview import rag  # Dùng cho các tính năng quản lý file cũ
+
+# --- IMPORT MODULE HIỆN TẠI (SQL + PARSER) ---
+from agent_adk import run_agent
+from file_parser import extract_text_from_file
+from vertexai.generative_models import GenerativeModel, Tool
+# ==================== 1. CẤU HÌNH & CREDENTIALS ====================
+PROJECT_ID = "reflecting-surf-477600-p4"
+LOCATION = "europe-west4" 
+DISPLAY_NAME = "OJT_Knowledge_Base" # Tên Corpus lưu trữ
 
 # ==================== CREDENTIALS ====================
 # 1. Đường dẫn trên Render (Secret File)
@@ -31,20 +40,19 @@ else:
         )
     print("--- Chạy Local: Sử dụng biến môi trường hệ thống ---")
 
-# ==================== VERTEX AI IMPORTS ====================
-import vertexai
-from vertexai.preview import rag
-from vertexai.generative_models import GenerativeModel, Tool
+if os.path.exists(render_secret_path):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = render_secret_path
+    print("--- DEPLOY MODE: Loaded Render Secret ---")
+elif os.path.exists(local_key_file):
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(local_key_file)
+    print(f"--- LOCAL MODE: Loaded {local_key_file} ---")
+else:
+    print("--- SYSTEM MODE: Using Default Environment Credentials ---")
 
-PROJECT_ID = "reflecting-surf-477600-p4"
-LOCATION = "europe-west4"
-DISPLAY_NAME = "ProductDocumentation"
-
-# Biến global để lưu corpus và model (sẽ được set trong lifespan)
+# Biến toàn cục lưu trữ Corpus
 corpus = None
 model = None
-
-# ==================== LIFESPAN (Startup/Shutdown) ====================
+# ==================== 2. LIFESPAN (KHỞI ĐỘNG HỆ THỐNG) ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global corpus, model
@@ -76,32 +84,52 @@ async def lifespan(app: FastAPI):
     # Shutdown (nếu cần cleanup)
     print("Shutting down...")
 
-# ==================== APP ====================
+# ==================== 3. KHỞI TẠO APP ====================
 app = FastAPI(
-    title="RAG OJT 2025 – FINAL FIXED",
-    version="12.1",
+    title="OJT Super Assistant (SQL + RAG + Files)",
+    version="2.0 Hybrid",
     lifespan=lifespan
 )
-
-@app.middleware("http")
-async def debug_origin(request, call_next): 
-    print("METHOD:", request.method)
-    print("ORIGIN:", request.headers.get("origin"))
-    return await call_next(request)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ==================== MODELS ====================
-class Question(BaseModel):
-    question: str
+# ==================== 4. CÁC API CỐT LÕI (SQL + CV Review) ====================
 
-# ==================== HELPERS ====================
+@app.post("/chat")
+async def chat_endpoint(
+    question: str = Form(...),
+    file: UploadFile = File(None)
+):
+    """
+    API Chính:
+    - Nếu có file upload -> Review CV (Dùng logic mới).
+    - Nếu không file -> Hỏi đáp Database SQL (Dùng logic agent_adk).
+    """
+    try:
+        file_text = None
+        # 1. Xử lý File Upload (RAM)
+        if file:
+            print(f"📂 Nhận file local: {file.filename}")
+            file_text = await extract_text_from_file(file, file.filename)
+            if file_text.startswith("Lỗi"):
+                return {"answer": file_text, "sql_debug": "N/A"}
+
+        # 2. Gọi Agent xử lý
+        print(f"📩 Question: {question}")
+        answer, sql = run_agent(question, file_content=file_text)
+        
+        return {"answer": answer, "sql_debug": sql}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== 5. CÁC API QUẢN TRỊ (Từ Code Cũ) ====================
+# Giúp bạn quản lý file trên Vertex AI Corpus (Knowledge Base lâu dài)
+
 def get_files_list() -> List:
     """Helper: Convert pager thành list files"""
     if corpus is None:
@@ -109,117 +137,77 @@ def get_files_list() -> List:
     files_pager = rag.list_files(corpus.name)
     return list(files_pager)
 
-# ==================== API ENDPOINTS ====================
-@app.get("/")
-async def root():
-    return {"message": "RAG Backend OJT", "status": "LIVE"}
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
-
 @app.get("/status")
 async def status():
     try:
         files = get_files_list()
         return {
-            "status": "HOÀN HẢO",
-            "model": "gemini-2.5-pro",
+            "status": "LIVE",
+            "mode": "Hybrid (SQL Agent + Vertex RAG)",
             "corpus": DISPLAY_NAME,
-            "total_files": len(files),
-            "files": [f.name.split("/")[-1] for f in files]
+            "total_indexed_files": len(files),
+            "indexed_files": [f.display_name for f in files]
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error in /status: {str(e)}")
+        return {"status": "ERROR", "detail": str(e)}
+
+
+
+@app.post("/import_pdf")
+async def import_pdf(
+    gcs_uri: str = Query(..., description="Nhập link GCS (gs://) hoặc Google Drive")
+):
+    try:
+        # 1. Bảo vệ: Kiểm tra xem RAG Corpus đã sẵn sàng chưa
+        if corpus is None:
+             raise HTTPException(status_code=503, detail="RAG Corpus chưa được khởi tạo (Do vùng server hoặc lỗi mạng).")
+
+        # 2. Logic cũ: Lấy danh sách file (để in log hoặc check cơ bản)
+        files = get_files_list()
+        
+        # Kiểm tra file đã tồn tại chưa
+        if any(gcs_uri in f.name for f in files):
+            return {"message": "File đã tồn tại"}
+        
+        # 3. Gọi lệnh Import (Truyền thẳng link vào, không chặn https)
+        print(f"📥 Đang import: {gcs_uri}")
+        rag.import_files(corpus.name, paths=[gcs_uri], chunk_size=512)
+        
+        # 4. Trả kết quả
+        # Cắt lấy tên file cuối cùng để hiển thị cho đẹp
+        file_name = gcs_uri.split("/")[-1]
+        return {"message": f"Import thành công: {file_name}"}
+
+    except Exception as e:
+        # In lỗi ra terminal để dễ debug nếu Google từ chối link
+        print(f"❌ Lỗi Import: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Import error: {str(e)}")
 
 @app.get("/list_files")
-async def list_files():
+async def list_files_endpoint():
     try:
         files = get_files_list()
         result = []
         for f in files:
-            # Khởi tạo gcs_uri mặc định là N/A
-            gcs_uri = "N/A"
-            
-            # Kiểm tra cấu trúc file_spec.gcs_source.uri (Cách Vertex AI RAG lưu)
-            if hasattr(f, 'file_spec') and f.file_spec.gcs_source:
-                gcs_uri = f.file_spec.gcs_source.uri
-            
+            gcs_uri = f.file_spec.gcs_source.uri if (hasattr(f, 'file_spec') and f.file_spec.gcs_source) else "N/A"
             result.append({
                 "display_name": f.display_name,
                 "gcs_uri": gcs_uri,
-                "resource_name": f.name # Đây là cái projects/.../ragFiles/...
+                "resource_name": f.name
             })
         return {"files": result}
     except Exception as e:
-        # Nếu vẫn lỗi, in toàn bộ đối tượng ra console để debug
-        if files and len(files) > 0:
-            print(f"DEBUG - Cấu trúc file mẫu: {files[0]}")
-        raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}")
-
-@app.post("/chat")
-async def chat(q: Question):
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model chưa sẵn sàng (Vertex AI init fail)")
-    try:
-        response = model.generate_content(q.question)
-        return {"answer": response.text.strip()}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
-
-@app.post("/import_pdf")
-async def import_pdf(gcs_uri: str = Query(...)):
-    try:
-        files = get_files_list()
-        if any(gcs_uri in f.name for f in files):
-            return {"message": "File đã tồn tại"}
-        
-        rag.import_files(corpus.name, paths=[gcs_uri])
-        file_name = gcs_uri.split("/")[-1]
-        return {"message": f"Import thành công: {file_name}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Import error: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=str(e))
 @app.delete("/delete_file")
 async def delete_file(
-    gcs_uri: Optional[str] = Query(None), 
-    resource_name: Optional[str] = Query(None)
+    resource_name: str = Query(..., description="Tên resource (projects/.../ragFiles/...) lấy từ API list_files")
 ):
-    """
-    Xóa file: Ưu tiên xóa theo resource_name nếu có, 
-    nếu không sẽ tìm theo gcs_uri.
-    """
     try:
-        target_name = None
-
-        # 1. Tìm ID của file trong Vertex AI
-        if resource_name:
-            target_name = resource_name
-        elif gcs_uri:
-            files = get_files_list()
-            target = next((f for f in files if gcs_uri in str(f)), None)
-            if target:
-                target_name = target.name
-        
-        if not target_name:
-            return {"error": "Không tìm thấy file để xóa. Vui lòng cung cấp resource_name chính xác."}
-
-        # 2. Xóa khỏi Vertex AI Corpus
-        rag.delete_file(name=target_name)
-        
-        # 3. Xóa file vật lý trên GCS (Nếu bạn có gcs_uri)
-        if gcs_uri and gcs_uri.startswith("gs://"):
-            try:
-                path_parts = gcs_uri.replace("gs://", "").split("/", 1)
-                storage_client = storage.Client()
-                storage_client.bucket(path_parts[0]).blob(path_parts[1]).delete()
-                print(f"Đã xóa GCS: {gcs_uri}")
-            except Exception as e_gcs:
-                print(f"GCS Delete Skip: {e_gcs}")
-
-        return {"message": f"Đã xóa thành công file: {target_name}"}
-
+        rag.delete_file(name=resource_name)
+        return {"message": f"Đã xóa vĩnh viễn: {resource_name}"}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-print("Main.py loaded successfully")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
