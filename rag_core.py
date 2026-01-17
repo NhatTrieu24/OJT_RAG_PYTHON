@@ -1,18 +1,32 @@
+import os
 import re
 from sqlalchemy import create_engine, text
 
-# ==================== CẤU HÌNH DATABASE ====================
-# User: ai_read_only
-# Pass: AI@123  --> Mã hóa URL thành: AI%40123 (Vì @ là ký tự đặc biệt)
-# DB:   OJT_RAG
+# ==================== CẤU HÌNH DATABASE THÔNG MINH ====================
 
-# DB_URL = "postgresql://ai_read_only:AI%40123@localhost:5432/OJT_RAG"
-DB_URL = "postgresql+psycopg2://postgres:123456@localhost:5432/OJT_RAG"
+# 1. CẤU HÌNH CHO MÁY TÍNH CỦA BẠN (LOCAL)
+# Lưu ý: 'postgres.railway.internal' CHỈ chạy được trên server Railway.
+# Ở máy nhà, bạn phải dùng Host Public (thường là roundhouse.proxy.rlwy.net...).
+# Bạn hãy thay 'HOST_PUBLIC' và 'PORT_PUBLIC' bằng thông tin trong tab Variables.
+LOCAL_DB_URL = "postgresql+psycopg2://postgres:NfVTuBOMhVKAVAqxIxZoJCTSLOiqvsgY@trolley.proxy.rlwy.net:14680/railway"
+# 2. LOGIC TỰ ĐỘNG CHỌN MÔI TRƯỜNG
+# - Nếu có biến DATABASE_URL (khi deploy lên Railway) -> Dùng nó (Internal).
+# - Nếu không (chạy máy nhà) -> Dùng LOCAL_DB_URL (Public).
+
+if "DATABASE_URL" in os.environ:
+    DB_URL = os.environ["DATABASE_URL"]
+    # Fix lỗi tương thích cho SQLAlchemy (postgres:// -> postgresql://)
+    if DB_URL.startswith("postgres://"):
+        DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+    print("🌍 [CONFIG] Detected Cloud Environment (Railway). Using Internal DB.")
+else:
+    DB_URL = LOCAL_DB_URL
+    print("💻 [CONFIG] Detected Local Environment. Using Public DB.")
+
 # Tạo engine kết nối
 try:
-    # pool_pre_ping=True giúp tự động kết nối lại nếu bị ngắt
     engine = create_engine(DB_URL, pool_size=10, pool_pre_ping=True)
-    print("🔌 Database Engine created successfully (User: ai_read_only).")
+    print(f"🔌 Database Engine created successfully.")
 except Exception as e:
     print(f"⚠️ Lỗi cấu hình Database: {e}")
 
