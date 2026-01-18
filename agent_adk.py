@@ -1,168 +1,138 @@
 import os
-import re
+import psycopg2
 import vertexai
-from vertexai.generative_models import (
-    GenerativeModel, Tool, FunctionDeclaration, GenerationConfig, Part
-)
-from rag_core import execute_sql, get_last_sql, clear_last_sql
+from vertexai.language_models import TextEmbeddingModel
 
-# ==================== 1. CẤU HÌNH HỆ THỐNG ====================
-PROJECT_ID = "reflecting-surf-477600-p4"
-LOCATION = "europe-west4" 
-
-# --- TỰ ĐỘNG NẠP CREDENTIALS ---
-key_path = os.path.join(os.getcwd(), "rag-service-account.json")
+# ==================== CẤU HÌNH & INIT ====================
+key_path = "rag-service-account.json"
 if os.path.exists(key_path):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
-    print(f"🔑 [ADK] Đã nạp Credentials từ: {key_path}")
-else:
-    print("⚠️ [ADK] Cảnh báo: Không tìm thấy file rag-service-account.json!")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(key_path)
 
+PROJECT_ID = "reflecting-surf-477600-p4"
+LOCATION = "europe-west4"
+DB_DSN = "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway"
+
+embedding_model = None
 try:
     vertexai.init(project=PROJECT_ID, location=LOCATION)
+    embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
+    print("✅ [Agent] Vertex AI Ready.")
 except Exception as e:
-    print(f"⚠️ Vertex AI Init Error: {e}")
+    print(f"⚠️ [Agent] Init Error: {e}")
 
-# ==================== 2. ĐỊNH NGHĨA CÔNG CỤ ====================
-sql_tool = Tool(
-    function_declarations=[
-        FunctionDeclaration(
-            name="query_ojt_database",
-            description="Chạy câu lệnh SQL PostgreSQL để truy xuất dữ liệu.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "sql_query": {
-                        "type": "string", 
-                        "description": "Câu lệnh SQL chuẩn. Phải tuân thủ các quy tắc Business Logic (is_active, mapping)."
-                    }
-                },
-                "required": ["sql_query"]
-            }
-        )
-    ]
-)
+# ==================== CORE FUNCTIONS ====================
 
-# ==================== 3. BỘ NÃO THÔNG MINH (SYSTEM PROMPT V6.0 - FINAL) ====================
-SYSTEM_INSTRUCTION = """
-BẠN LÀ TRỢ LÝ ẢO THÔNG MINH HỖ TRỢ SINH VIÊN OJT.
-
-NHIỆM VỤ:
-1. Trả lời câu hỏi dựa trên Database (SQL) hoặc Tài liệu.
-2. Cross-Language Search (Dịch từ khóa Việt -> Anh).
-
---- QUY TẮC SQL & BUSINESS LOGIC (TUÂN THỦ TUYỆT ĐỐI) ---
-
-RULE 1: TÊN BẢNG & QUYỀN TRUY CẬP
-- Bảng người dùng là `"User"` (có dấu ngoặc kép, chữ U hoa).
-- Khi truy vấn bảng này: `SELECT ... FROM "User" ...`
-
-RULE 2: TÌM VIỆC LÀM (JOB SEARCH)
-- Mặc định phải tìm job đang mở: `jp.is_active = true`.
-- Về trạng thái công ty (`semester_company`): Vì dữ liệu có thể chưa cập nhật, hãy chấp nhận cả NULL.
-  -> `(sc.status = 'active' OR sc.status IS NULL)`
-
-RULE 3: MAPPING ĐỊA ĐIỂM (GEO MAPPING)
-- DB lưu không dấu ("Hanoi", "Ho Chi Minh"). User hỏi có dấu ("Hà Nội").
-- "Hà Nội" -> `(location ILIKE '%Hanoi%' OR location ILIKE '%Ha Noi%' OR location ILIKE '%Hà Nội%')`
-- "HCM"/"Sài Gòn" -> `(location ILIKE '%Ho Chi Minh%' OR location ILIKE '%HCM%')`
-
-RULE 4: MAPPING TỪ KHÓA (KEYWORD MAPPING)
-- "Lập trình viên" -> `(job_title ILIKE '%Developer%' OR job_title ILIKE '%Engineer%' OR job_title ILIKE '%Programmer%')`
-- "An ninh mạng"/"Bảo mật" -> `(job_title ILIKE '%Security%' OR job_title ILIKE '%Cyber%')`
-- "Thực tập sinh" -> `(job_title ILIKE '%Intern%')`
-
-RULE 5: KIỂM TRA TRẠNG THÁI (CÒN TUYỂN KHÔNG?)
-- Nếu user hỏi "Còn tuyển không?", ĐỪNG lọc `is_active = true`.
-- Hãy SELECT cột `is_active` để trả lời.
-"""
-
-# Khởi tạo Model
-model = GenerativeModel(
-    "gemini-2.5-pro", 
-    tools=[sql_tool],
-    system_instruction=SYSTEM_INSTRUCTION
-)
-
-# ==================== 4. HÀM XỬ LÝ TEXT AN TOÀN ====================
-def get_safe_response_text(response):
-    """Đảm bảo không crash khi model trả về FunctionCall không có text."""
+def get_query_embedding(text):
+    if not embedding_model: return None
     try:
-        if hasattr(response, 'text') and response.text:
-            return response.text
-    except Exception:
-        pass 
+        return embedding_model.get_embeddings([text[:2000]])[0].values
+    except: return None
 
+def search_vectors(question, target_table="auto", limit=5):
+    """
+    Tìm kiếm thông minh: Tự động chọn bảng và xử lý lỗi NULL an toàn
+    """
+    print(f"🔍 [Search] Đang tìm: '{question}'...")
+    query_vector = get_query_embedding(question)
+    if not query_vector: return "Lỗi hệ thống: Không tạo được vector."
+
+    conn = None
     try:
-        final_text = []
-        if response.candidates:
-            for part in response.candidates[0].content.parts:
-                if part.text:
-                    final_text.append(part.text)
+        conn = psycopg2.connect(dsn=DB_DSN)
+        cur = conn.cursor()
         
-        result = "\n".join(final_text).strip()
-        if result:
-            return result
-    except Exception:
-        pass
-
-    return "" 
-
-# ==================== 5. LOGIC CHÍNH ====================
-def run_agent(user_message, file_content=None):
-    clear_last_sql()
-    chat = model.start_chat()
-    
-    try:
-        with open("rag_brain.txt", "r", encoding="utf-8") as f:
-            brain = f.read()
-    except:
-        brain = "Bạn là trợ lý ảo OJT."
-
-    # Tiền xử lý Input
-    clean_msg = re.sub(r'\b25\b', '2025', user_message)
-    
-    prompt_suffix = "\n[LƯU Ý]: Kiểm tra kỹ mapping địa điểm (Hanoi) và từ khóa (Developer, Security)."
-
-    if file_content:
-        full_prompt = f"{brain}\n\n=== DOCUMENT ===\n{file_content}\n\nUSER REQUEST: {clean_msg}{prompt_suffix}"
-    else:
-        full_prompt = f"{brain}\n\nUSER REQUEST: {clean_msg}{prompt_suffix}"
-
-    try:
-        # Gửi Prompt
-        response = chat.send_message(
-            full_prompt, 
-            generation_config=GenerationConfig(temperature=0.0)
-        )
+        # 1. LOGIC CHỌN BẢNG THÔNG MINH
+        tables_to_search = []
+        q_lower = question.lower()
         
-        # XỬ LÝ FUNCTION CALL
-        if response.candidates and response.candidates[0].content.parts:
-            for part in response.candidates[0].content.parts:
-                if part.function_call:
-                    args = part.function_call.args
-                    sql = args.get("sql_query") or args.get("user_query")
-                    
-                    print(f"🤖 AI Thinking & SQL: {sql}")
-                    
-                    # Thực thi SQL
-                    db_result = execute_sql(sql)
-                    
-                    if not db_result:
-                        db_result = "QUERY RETURNED NO DATA. (Check SQL logic or Keywords)"
-
-                    # Gửi kết quả DB lại cho AI
-                    final_res = chat.send_message(
-                        [Part.from_function_response(name="query_ojt_database", response={"content": str(db_result)})]
-                    )
-                    return get_safe_response_text(final_res), get_last_sql()
-
-        safe_text = get_safe_response_text(response)
-        if not safe_text:
-            return "Xin lỗi, tôi đang xử lý dữ liệu nhưng gặp trục trặc khi tạo câu trả lời.", get_last_sql()
+        # Tự động phát hiện ý định
+        if any(k in q_lower for k in ["ojt", "tài liệu", "quy trình", "hướng dẫn", "giới thiệu", "học kỳ"]):
+            tables_to_search.append("ojtdocument")
+        
+        if any(k in q_lower for k in ["job", "việc", "lương", "tuyển", "vị trí", "dev", "java", "net", "thực tập"]):
+            tables_to_search.append("job_position")
             
-        return safe_text, get_last_sql()
+        # Mặc định tìm cả 2 nếu không rõ
+        if not tables_to_search:
+            tables_to_search = ["ojtdocument", "job_position"]
+
+        # Nếu AI chỉ định rõ (override)
+        if target_table == "ojtdocument": tables_to_search = ["ojtdocument"]
+        elif target_table == "job_position": tables_to_search = ["job_position"]
+
+        final_results = []
+        
+        # 2. CHẠY TÌM KIẾM TRÊN TỪNG BẢNG
+        for table in tables_to_search:
+            if table == "ojtdocument":
+                cols = "title, file_url"
+                prefix = "TÀI LIỆU"
+            elif table == "job_position":
+                cols = "job_title, requirements, location, salary"
+                prefix = "CÔNG VIỆC"
+            else:
+                continue
+
+            # SQL: Thêm điều kiện embedding IS NOT NULL để tránh lỗi
+            sql = f"""
+                SELECT {cols}, 1 - (embedding <=> %s::vector) as similarity
+                FROM "{table}"
+                WHERE embedding IS NOT NULL 
+                ORDER BY embedding <=> %s::vector
+                LIMIT 3;
+            """
+            cur.execute(sql, (query_vector, query_vector))
+            rows = cur.fetchall()
+            
+            for row in rows:
+                # --- SỬA LỖI Ở ĐÂY: Kiểm tra None trước khi dùng ---
+                similarity = row[-1]
+                
+                if similarity is None: 
+                    continue # Bỏ qua dòng lỗi
+
+                if similarity > 0.40: # Độ khớp > 40%
+                    content = ", ".join([str(item) for item in row[:-1] if item is not None])
+                    final_results.append(f"[{prefix}] {content} (Độ khớp: {similarity:.2f})")
+
+        if not final_results:
+            return "Không tìm thấy dữ liệu nào phù hợp trong hệ thống."
+            
+        return "\n".join(final_results)
 
     except Exception as e:
-        print(f"❌ Error in Agent: {e}")
-        return f"Hệ thống đang bận, vui lòng thử lại sau. (Chi tiết: {str(e)})", get_last_sql()
+        print(f"❌ DB Error: {e}")
+        return f"Lỗi Database: {e}"
+    finally:
+        if conn: conn.close()
+
+# ==================== LOGIC CHAT ====================
+
+def run_agent(question: str, file_content: str = None):
+    from rag_core import start_chat_session, get_chat_response
+    
+    prompt = question
+    if file_content:
+        prompt = f"Thông tin bổ sung:\n{file_content}\n\nCâu hỏi: {question}"
+
+    chat_session = start_chat_session()
+    response = get_chat_response(chat_session, prompt)
+    return response, "Mode: Vector Search"
+
+def run_cv_review(cv_text: str, user_message: str):
+    from rag_core import start_chat_session
+    
+    matched_jobs = search_vectors(cv_text, target_table="job_position", limit=3)
+    
+    prompt = f"""
+    Bạn là chuyên gia tuyển dụng. 
+    CV Ứng viên: {cv_text[:3000]}
+    Job phù hợp: {matched_jobs}
+    Câu hỏi: "{user_message}"
+    
+    Hãy đưa ra lời khuyên và gợi ý job phù hợp.
+    """
+    
+    chat_session = start_chat_session()
+    response = chat_session.send_message(prompt)
+    return response.text, "Mode: CV Review"

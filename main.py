@@ -1,195 +1,190 @@
-from typing import List  # ✅ Đã sửa lỗi chính tả (From -> from) và đúng module
 import os
+import re
+import uvicorn
 import vertexai
+import psycopg2
+import requests
+import pdfplumber
+import docx
+from urllib.parse import unquote
 from contextlib import asynccontextmanager
+from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from google.cloud import storage
-from vertexai.preview import rag  
+from google.cloud import storage 
 
-# --- IMPORT MODULE HIỆN TẠI (SQL + PARSER) ---
-from agent_adk import run_agent
+# Import logic
+from agent_adk import run_agent, run_cv_review, get_query_embedding 
 from file_parser import extract_text_from_file
-from vertexai.generative_models import GenerativeModel, Tool
 
-# ==================== 1. CẤU HÌNH & CREDENTIALS ====================
+# ==================== CẤU HÌNH ====================
 PROJECT_ID = "reflecting-surf-477600-p4"
 LOCATION = "europe-west4" 
-DISPLAY_NAME = "OJT_Knowledge_Base" 
+DB_DSN = "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway"
 
-# ==================== CREDENTIALS ====================
-# 1. Đường dẫn trên Render (Secret File)
-render_secret_path = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
-# 2. Đường dẫn local (Cùng thư mục với main.py)
-local_key_file = "rag-service-account.json" 
+render_secret = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
+local_key = "rag-service-account.json" 
 
-# Logic kiểm tra Credentials gọn gàng
-if os.path.exists(render_secret_path):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = render_secret_path
-    print("--- DEPLOY MODE: Loaded Render Secret ---")
-elif os.path.exists(local_key_file):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(local_key_file)
-    print(f"--- LOCAL MODE: Loaded {local_key_file} ---")
-else:
-    # Nếu không thấy file nào, kiểm tra xem biến môi trường hệ thống có sẵn chưa
-    if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
-        print("⚠️ CẢNH BÁO: Không tìm thấy file credentials json!")
-    else:
-        print("--- SYSTEM MODE: Using Default Environment Credentials ---")
+if os.path.exists(render_secret): 
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = render_secret
+elif os.path.exists(local_key): 
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(local_key)
 
-# Biến toàn cục lưu trữ Corpus
-corpus = None
-model = None
+# ==================== HELPER FUNCTIONS ====================
 
-# ==================== 2. LIFESPAN (KHỞI ĐỘNG HỆ THỐNG) ====================
+def get_filename_from_cd(cd):
+    if not cd: return None
+    fname_match = re.search(r"filename\*=UTF-8''(.+)", cd)
+    if fname_match: return unquote(fname_match.group(1))
+    fname_match = re.search(r'filename="?([^"]+)"?', cd)
+    if fname_match:
+        filename = fname_match.group(1)
+        try: return filename.encode('iso-8859-1').decode('utf-8')
+        except: return filename
+    return None
+
+def download_drive_file(drive_url, destination_path):
+    try:
+        file_id = None
+        match = re.search(r"/d/([a-zA-Z0-9_-]+)", drive_url)
+        if match: file_id = match.group(1)
+        else:
+            match = re.search(r"id=([a-zA-Z0-9_-]+)", drive_url)
+            if match: file_id = match.group(1)
+            
+        if not file_id: return False, "Unknown.pdf"
+
+        url = f"https://drive.google.com/uc?id={file_id}&export=download"
+        print(f"⬇️ Downloading Drive ID: {file_id}...")
+        
+        response = requests.get(url, stream=True)
+        
+        filename = "Google_Drive_Doc.pdf"
+        if "Content-Disposition" in response.headers:
+            detected_name = get_filename_from_cd(response.headers["Content-Disposition"])
+            if detected_name: filename = detected_name
+                
+        filename = re.sub(r'[\\/*?:"<>|]', "", filename)
+
+        with open(destination_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk: f.write(chunk)
+                
+        print(f"✅ Saved as: {filename}")
+        return True, filename
+
+    except Exception as e:
+        print(f"❌ Drive Error: {e}")
+        return False, None
+
+def extract_text_local(file_path):
+    text = ""
+    try:
+        if file_path.endswith(".pdf"):
+            with pdfplumber.open(file_path) as pdf:
+                for p in pdf.pages: text += p.extract_text() or ""
+        elif file_path.endswith(".docx"):
+            doc = docx.Document(file_path)
+            for p in doc.paragraphs: text += p.text + "\n"
+    except: pass
+    return text
+
+# ==================== LIFESPAN & APP ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global corpus, model
     try:
-        print("Initializing Vertex AI...")
         vertexai.init(project=PROJECT_ID, location=LOCATION)
-        
-        # Load or create corpus
-        corpora = rag.list_corpora()
-        corpus = next((c for c in corpora if c.display_name == DISPLAY_NAME), None)
-        if not corpus:
-            print("Tạo corpus mới...")
-            corpus = rag.create_corpus(display_name=DISPLAY_NAME)
-        
-        # Setup retrieval tool
-        rag_resource = rag.RagResource(rag_corpus=corpus.name)
-        retrieval_tool = Tool.from_retrieval(
-            retrieval=rag.Retrieval(source=rag.VertexRagStore(rag_resources=[rag_resource]))
-        )
-        
-        model = GenerativeModel("gemini-2.5-pro", tools=[retrieval_tool])
-        print("✅ Vertex AI RAG initialized successfully!")
-    except Exception as e:
-        print(f"❌ Vertex AI initialization FAILED: {str(e)}")
-    
-    yield  # Chạy ứng dụng
-    
-    print("Shutting down...")
+        print("✅ Vertex AI initialized!")
+    except: print("❌ Vertex AI Init Failed")
+    yield
 
-# ==================== 3. KHỞI TẠO APP ====================
-app = FastAPI(
-    title="OJT Super Assistant (SQL + RAG + Files).v1",
-    version="2.0 Hybrid",
-    lifespan=lifespan
-)
+app = FastAPI(title="OJT Assistant (Vector) V1", version="Final.3", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ==================== 4. CÁC API CỐT LÕI (SQL + CV Review) ====================
-
+# ==================== API 1: CHAT ====================
 @app.post("/chat")
-async def chat_endpoint(
-    question: str = Form(...),
-    file: UploadFile = File(None)
-):
-    """
-    API Chính:
-    - Nếu có file upload -> Review CV (Dùng logic mới).
-    - Nếu không file -> Hỏi đáp Database SQL (Dùng logic agent_adk).
-    """
+async def chat_endpoint(question: str = Form(...), file: UploadFile = File(None)):
     try:
-        file_text = None
-        # 1. Xử lý File Upload (RAM)
         if file:
-            print(f"📂 Nhận file local: {file.filename}")
-            # Gọi hàm async đọc file (PDF/DOCX)
-            file_text = await extract_text_from_file(file, file.filename)
-            
-            # Nếu đọc file bị lỗi thì trả về luôn
-            if file_text.startswith("Lỗi"):
-                return {"answer": file_text, "sql_debug": "N/A"}
-
-        # 2. Gọi Agent xử lý
-        print(f"📩 Question: {question}")
-        answer, sql = run_agent(question, file_content=file_text)
-        
-        return {"answer": answer, "sql_debug": sql}
+            cv_text = await extract_text_from_file(file, file.filename)
+            if cv_text.startswith("Lỗi"): return {"answer": "Lỗi đọc CV.", "sql_debug": "Error"}
+            answer, debug = run_cv_review(cv_text, question)
+            return {"answer": answer, "sql_debug": debug}
+        else:
+            answer, debug = run_agent(question)
+            return {"answer": answer, "sql_debug": debug}
     except Exception as e:
-        print(f"Server Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== 5. CÁC API QUẢN TRỊ (Quản lý Knowledge Base) ====================
+# ==================== API 2: IMPORT ====================
+@app.post("/import_pdf")
+async def import_pdf(url: str = Query(...)):
+    temp_file = "temp_import.pdf"
+    conn = None
+    try:
+        real_filename = "Imported_Doc.pdf"
+        
+        if "drive.google.com" in url:
+            success, fname = download_drive_file(url, temp_file)
+            if not success: return {"message": "Lỗi tải Google Drive."}
+            real_filename = fname 
+        elif url.startswith("gs://"):
+             return {"message": "Hiện tại ưu tiên Drive link."}
+        else:
+            return {"message": "Link không hỗ trợ."}
 
-def get_files_list() -> List:
-    """Helper: Convert pager thành list files"""
-    if corpus is None:
-        raise HTTPException(status_code=503, detail="Vertex AI chưa khởi tạo thành công")
-    files_pager = rag.list_files(corpus.name)
-    return list(files_pager)
+        content = extract_text_local(temp_file)
+        if not content: return {"message": "File rỗng."}
+        
+        vector = get_query_embedding(content[:8000])
+        
+        conn = psycopg2.connect(dsn=DB_DSN)
+        cur = conn.cursor()
+        
+        sql = "INSERT INTO ojtdocument (title, file_url, embedding) VALUES (%s, %s, %s)"
+        cur.execute(sql, (real_filename, url, vector))
+        conn.commit()
+        
+        return {"message": f"✅ Import thành công: {real_filename}", "title": real_filename}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if os.path.exists(temp_file): os.remove(temp_file)
+        if conn: conn.close()
+
+# ==================== CÁC API KHÁC (FIXED SYNTAX) ====================
+@app.get("/list_files")
+async def list_files_endpoint():
+    conn = None
+    try:
+        conn = psycopg2.connect(dsn=DB_DSN)
+        cur = conn.cursor()
+        cur.execute("SELECT ojtdocument_id, title, file_url FROM ojtdocument ORDER BY ojtdocument_id DESC")
+        rows = cur.fetchall()
+        files = [{"id": r[0], "display_name": r[1], "gcs_uri": r[2]} for r in rows]
+        return {"files": files}
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
+@app.delete("/delete_file")
+async def delete_file(resource_name: str = Query(...)):
+    conn = None
+    try:
+        conn = psycopg2.connect(dsn=DB_DSN)
+        cur = conn.cursor()
+        if resource_name.isdigit(): cur.execute("DELETE FROM ojtdocument WHERE ojtdocument_id = %s", (resource_name,))
+        else: cur.execute("DELETE FROM ojtdocument WHERE title = %s", (resource_name,))
+        conn.commit()
+        return {"message": f"Đã xóa: {resource_name}"}
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
 
 @app.get("/status")
 async def status():
-    try:
-        files = get_files_list()
-        return {
-            "status": "LIVE",
-            "mode": "Hybrid (SQL Agent + Vertex RAG)",
-            "corpus": DISPLAY_NAME,
-            "total_indexed_files": len(files),
-            "indexed_files": [f.display_name for f in files]
-        }
-    except Exception as e:
-        return {"status": "ERROR", "detail": str(e)}
-
-@app.post("/import_pdf")
-async def import_pdf(
-    gcs_uri: str = Query(..., description="Nhập link GCS (gs://) hoặc Google Drive")
-):
-    try:
-        if corpus is None:
-             raise HTTPException(status_code=503, detail="RAG Corpus chưa được khởi tạo.")
-
-        files = get_files_list()
-        if any(gcs_uri in f.name for f in files):
-            return {"message": "File đã tồn tại"}
-        
-        print(f"📥 Đang import: {gcs_uri}")
-        rag.import_files(corpus.name, paths=[gcs_uri], chunk_size=512)
-        
-        file_name = gcs_uri.split("/")[-1]
-        return {"message": f"Import thành công: {file_name}"}
-
-    except Exception as e:
-        print(f"❌ Lỗi Import: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Import error: {str(e)}")
-
-@app.get("/list_files")
-async def list_files_endpoint():
-    try:
-        files = get_files_list()
-        result = []
-        for f in files:
-            gcs_uri = f.file_spec.gcs_source.uri if (hasattr(f, 'file_spec') and f.file_spec.gcs_source) else "N/A"
-            result.append({
-                "display_name": f.display_name,
-                "gcs_uri": gcs_uri,
-                "resource_name": f.name
-            })
-        return {"files": result}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/delete_file")
-async def delete_file(
-    resource_name: str = Query(..., description="Tên resource cần xóa")
-):
-    try:
-        rag.delete_file(name=resource_name)
-        return {"message": f"Đã xóa vĩnh viễn: {resource_name}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "LIVE", "mode": "Vector Postgres + Fixed Syntax"}
 
 if __name__ == "__main__":
-    import uvicorn
-    # Chạy server
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

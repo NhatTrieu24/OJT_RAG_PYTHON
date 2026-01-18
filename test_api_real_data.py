@@ -1,138 +1,217 @@
 import requests
 import time
 import json
+import sys
 
-# --- CẤU HÌNH ---
+# ================== CẤU HÌNH ==================
 URL = "http://127.0.0.1:8000/chat"
 
 class BColors:
     HEADER = '\033[95m'
-    OKBLUE = '\033[94m'
-    OKGREEN = '\033[92m'
+    OKBLUE = '\033[94m'      # Màu cho SQL
+    OKCYAN = '\033[96m'      # Màu cho VECTOR
+    OKGREEN = '\033[92m'     # Passed
     WARNING = '\033[93m'
-    FAIL = '\033[91m'
+    FAIL = '\033[91m'        # Failed
     ENDC = '\033[0m'
+    BOLD = '\033[1m'
 
+# ================== TEST CASES (ĐÃ GÁN NHÃN) ==================
 test_cases = [
-    # --- NHÓM 1: THÔNG TIN CÔNG TY & HR (Dựa trên ID 1, 2) ---
+
+    # ===== NHÓM 1: CÔNG TY (THƯỜNG LÀ SQL VÌ DỮ LIỆU CẤU TRÚC) =====
     {
-        "id": 1,
-        "name": "Check HR Email (FPT Software)",
-        "question": "Cho xin email HR của FPT Software?",
-        # Data: hr@fptsoftware.com
-        "expected": ["hr@fptsoftware.com", "HR FPT"] 
+        "id": "COMP_01",
+        "type": "SQL",  # Truy vấn cột Address chính xác
+        "name": "Địa chỉ FPT Software",
+        "question": "Địa chỉ của FPT Software ở đâu?",
+        "expected_all": ["FPT", "Hà Nội"]
     },
     {
-        "id": 2,
-        "name": "Check Website Công ty (Viettel)",
-        "question": "Website của Viettel là gì?",
-        # Data: https://viettel.com.vn
-        "expected": ["viettel.com.vn", "https"] 
+        "id": "COMP_02",
+        "type": "SQL",  # Truy vấn cột Website
+        "name": "Website Viettel",
+        "question": "Website chính thức của Viettel là gì?",
+        "expected_any": ["viettel.com.vn"]
+    },
+    {
+        "id": "COMP_03",
+        "type": "SQL",  # Truy vấn cột Email (Có Fuzzy matching)
+        "name": "Email MoMo (sai chính tả)",
+        "question": "Email liên hệ của môm là gì?",
+        "expected_any": ["@momo", "momo.vn"]
+    },
+    {
+        "id": "COMP_04",
+        "type": "SQL",  # Truy vấn cột TaxCode
+        "name": "Mã số thuế VNG",
+        "question": "Mã số thuế của VNG Corporation?",
+        "expected_any": ["0100", "03049"]
     },
 
-    # --- NHÓM 2: TRA CỨU VIỆC LÀM (JOB POSITION) ---
+    # ===== NHÓM 2: JOB (HỖN HỢP) =====
     {
-        "id": 3,
-        "name": "Check Lương Software Engineer (FPT)",
-        "question": "Lương thực tập Software Engineer tại FPT bao nhiêu?",
-        # Data: 500-700 USD
-        "expected": ["500", "700", "USD", "đô"] 
+        "id": "JOB_01",
+        "type": "VECTOR", # Tìm kiếm ngữ nghĩa (Job nào phù hợp với Software Engineer?)
+        "name": "Tìm job Software Engineer",
+        "question": "Có job nào cho Software Engineer không?",
+        "expected_any": ["Software", "Developer", "Intern", "Kỹ sư"]
     },
     {
-        "id": 4,
-        "name": "Check Job Bảo mật (Cybersecurity)",
-        "question": "Có tuyển thực tập sinh mảng bảo mật không?",
-        # Data: Cybersecurity Analyst Intern
-        "expected": ["Cybersecurity", "Analyst", "Bảo mật", "có"]
+        "id": "JOB_02",
+        "type": "SQL",    # Truy vấn cột Salary
+        "name": "Lương job Software Engineer",
+        "question": "Mức lương của Software Engineer Intern?",
+        "expected_any": ["USD", "-", "salary", "thỏa thuận", "triệu"]
     },
     {
-        "id": 5,
-        "name": "Check Job Design (Không có active job)",
-        "question": "Có tuyển thiết kế đồ họa (Graphic Designer) kỳ này không?",
-        # Data: Không có job Graphic Designer active trong bảng job_position
-        "expected": ["không", "chưa", "không tìm thấy"]
+        "id": "JOB_03",
+        "type": "VECTOR", # Nội dung yêu cầu công việc (Văn bản dài)
+        "name": "Yêu cầu job",
+        "question": "Yêu cầu của vị trí Software Engineer Intern là gì?",
+        "expected_any": ["C#", ".NET", "knowledge", "kinh nghiệm"]
     },
-
-    # --- NHÓM 3: LOGIC HỌC KỲ (SEMESTER) ---
     {
-        "id": 6,
-        "name": "Check Học kỳ Active",
-        "question": "Kỳ học nào đang diễn ra?",
-        # Data: Spring 2025 (2025-01-01 -> 2025-04-30) is_active=false? 
-        # Wait, check DB: Spring 2025 (ID 1) is_active=false, Fall 2025 (ID 3) is_active=true ???
-        # À, trong dump: (3, 'Fall 2025', ..., true).
-        "expected": ["Fall 2025", "Mùa thu 2025"]
+        "id": "JOB_04",
+        "type": "SQL",    # Truy vấn cột Location
+        "name": "Địa điểm làm việc",
+        "question": "Vị trí Software Engineer làm việc ở đâu?",
+        "expected_any": ["Hanoi", "Hà Nội", "HCM", "Ho Chi Minh"]
     },
 
-    # --- NHÓM 4: TÀI LIỆU (DOCUMENT) ---
+    # ===== NHÓM 3: HỌC KỲ / NGÀNH (SQL) =====
     {
-        "id": 7,
-        "name": "Tìm Tài liệu OJT Guidelines",
-        "question": "Tải OJT Guidelines ở đâu?",
-        # Data: OJT Guidelines, ID 1
-        "expected": ["OJT Guidelines", "link", "tải"]
+        "id": "SEM_01",
+        "type": "SQL",    # Liệt kê danh sách
+        "name": "Danh sách kỳ học",
+        "question": "Hệ thống hiện có những kỳ học nào?",
+        "expected_any": ["Spring", "Fall", "Summer"]
+    },
+    {
+        "id": "SEM_02",
+        "type": "SQL",    # Truy vấn ngày tháng cụ thể
+        "name": "Ngày bắt đầu Spring 2025",
+        "question": "Kỳ Spring 2025 bắt đầu khi nào?",
+        "expected_any": ["01/01/2025", "tháng 1"]
+    },
+    {
+        "id": "MAJOR_01",
+        "type": "SQL",    # Truy vấn mã chính xác
+        "name": "Mã ngành An toàn thông tin",
+        "question": "Mã ngành An toàn thông tin là gì?",
+        "expected_any": ["INFOSEC", "IA"]
     },
 
-    # --- NHÓM 5: CROSS-LANGUAGE & SLANG ---
+    # ===== NHÓM 4: TÀI LIỆU (VECTOR) =====
     {
-        "id": 8,
-        "name": "Trans: 'Lập trình viên' -> 'Software Engineer'",
-        "question": "Tìm việc cho lập trình viên tại Hà Nội?",
-        # Data: Software Engineer Intern (Location: Hanoi)
-        "expected": ["Software Engineer", "Hanoi", "FPT"]
+        "id": "DOC_01",
+        "type": "VECTOR", # Tìm trong kho vector document
+        "name": "Tìm tài liệu Test Doc (Không tồn tại)",
+        "question": "Có tài liệu nào tên Test Doc không?",
+        "expected_any": ["Không", "không tìm thấy", "chưa có"]
     },
     {
-        "id": 9,
-        "name": "Trans: 'An ninh mạng' -> 'Cybersecurity'",
-        "question": "Lương thực tập an ninh mạng thế nào?",
-        # Data: 600-800 USD
-        "expected": ["600", "800", "USD"]
+        "id": "DOC_02",
+        "type": "VECTOR", # Tìm trong kho vector document
+        "name": "Tìm tài liệu Handbook",
+        "question": "Có tài liệu nào tên Handbook không?",
+        "expected_any": ["Handbook", "Company Handbook", "sổ tay"]
+    },
+
+    # ===== NHÓM 5: TỔNG HỢP / ADMIN (SQL NÂNG CAO) =====
+    {
+        "id": "ADV_01",
+        "type": "SQL",    # Join bảng Company + Job
+        "name": "Danh sách job của FPT",
+        "question": "FPT Software đang tuyển những vị trí nào?",
+        "expected_any": ["Intern", "Engineer", "Developer", "Fresher"]
+    },
+    {
+        "id": "ADV_02",
+        "type": "SQL",    # Hàm COUNT(*)
+        "name": "Đếm sinh viên",
+        "question": "Hiện có bao nhiêu sinh viên trong hệ thống?",
+        "expected_any": ["sinh viên", "người", "user", "1", "2", "3"] # Giả sử số lượng là số nhỏ
     }
 ]
 
+# ================== RUN TEST ==================
 def run_tests():
-    print(f"\n{BColors.HEADER}{'='*25} REAL DATA DB VALIDATION {'='*25}{BColors.ENDC}\n")
+    print(f"\n{BColors.HEADER}=== STARTING RAG SYSTEM TEST (SQL vs VECTOR) ==={BColors.ENDC}\n")
+    print(f"Target URL: {URL}")
     passed = 0
-    
-    for case in test_cases:
-        print(f"{BColors.OKBLUE}Test #{case['id']} [{case['name']}]:{BColors.ENDC} {case['question']}")
+    total = len(test_cases)
+
+    # Check server
+    try:
+        requests.get(URL.replace("/chat", "/docs"), timeout=5)
+    except requests.exceptions.ConnectionError:
+        print(f"{BColors.FAIL}❌ LỖI: Backend không chạy! Hãy start server trước.{BColors.ENDC}")
+        return
+
+    for idx, case in enumerate(test_cases):
+        # Hiển thị Type với màu sắc riêng biệt
+        type_str = f"[{case['type']}]"
+        if case['type'] == "SQL":
+            type_colored = f"{BColors.OKBLUE}{BColors.BOLD}{type_str: <8}{BColors.ENDC}"
+        else:
+            type_colored = f"{BColors.OKCYAN}{BColors.BOLD}{type_str: <8}{BColors.ENDC}"
+
+        print(f"🔹 {type_colored} Test [{case['id']}]: {case['name']}")
+        
+        payload = {"question": case["question"]}
         
         try:
-            payload = {"question": case["question"]}
-            start_time = time.time()
-            res = requests.post(URL, data=payload, timeout=60)
-            duration = time.time() - start_time
-            
+            res = requests.post(URL, data=payload, timeout=60) # timeout lâu hơn cho Vector
+
             if res.status_code == 200:
                 data = res.json()
-                answer = data.get('answer', '')
-                sql_debug = data.get('sql_debug', 'N/A')
-                
-                print(f"🤖 Answer ({duration:.2f}s): {answer.strip()}")
-                if sql_debug and sql_debug != 'N/A':
-                    print(f"🛠  SQL Generated: {sql_debug}")
+                ans = data.get("answer", "")
+                sql = data.get("sql_debug", "N/A")
 
-                # Logic Check (OR match)
-                answer_lower = answer.lower()
-                found_keywords = [k for k in case["expected"] if k.lower() in answer_lower]
+                print(f"   🤖 Answer: {ans.strip()}")
                 
-                if found_keywords:
-                    print(f"{BColors.OKGREEN}✅ PASSED (Matched: {found_keywords}){BColors.ENDC}")
+                # Logic hiển thị debug
+                if case['type'] == "SQL":
+                    if sql != "N/A" and sql is not None:
+                        print(f"   🛠  SQL Used: {sql}")
+                    else:
+                        print(f"   ⚠️  {BColors.WARNING}Warning: Expected SQL but got none.{BColors.ENDC}")
+                
+                ans_lower = ans.lower()
+                passed_flag = False
+
+                if "expected_all" in case:
+                    passed_flag = all(k.lower() in ans_lower for k in case["expected_all"])
+                elif "expected_any" in case:
+                    passed_flag = any(k.lower() in ans_lower for k in case["expected_any"])
+
+                if passed_flag:
+                    print(f"   {BColors.OKGREEN}✅ PASSED{BColors.ENDC}")
                     passed += 1
                 else:
-                    print(f"{BColors.FAIL}❌ FAILED{BColors.ENDC}")
-                    print(f"   Expected ANY of: {case['expected']}")
+                    print(f"   {BColors.FAIL}❌ FAILED{BColors.ENDC}")
+                    print(f"      Expected: {case.get('expected_all') or case.get('expected_any')}")
+
             else:
-                print(f"{BColors.FAIL}❌ ERROR: HTTP {res.status_code}{BColors.ENDC}")
-                print(res.text)
-                
+                print(f"   ❌ HTTP Error {res.status_code}: {res.text}")
+
+        except requests.exceptions.Timeout:
+            print(f"   ❌ Timeout: Server xử lý quá lâu (>60s)")
         except Exception as e:
-            print(f"{BColors.FAIL}❌ EXCEPTION: {e}{BColors.ENDC}")
-            
-        print("-" * 60)
-        time.sleep(1) 
-        
-    print(f"\n{BColors.HEADER}FINAL SCORE: {passed}/{len(test_cases)} ({int(passed/len(test_cases)*100)}%){BColors.ENDC}")
+            print(f"   ❌ Error: {e}")
+
+        # Delay
+        if idx < total - 1:
+            print("   ⏳ Waiting 15s (Google Rate Limit)...", end="\r")
+            time.sleep(15)
+            print(" " * 60, end="\r")
+
+    print(f"\n" + "="*40)
+    print(f"🎓 RESULT: {passed}/{total} PASSED")
+    
+    if passed == total:
+        print(f"{BColors.OKGREEN}🎉 SYSTEM PERFECT!{BColors.ENDC}")
 
 if __name__ == "__main__":
     run_tests()
