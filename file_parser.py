@@ -1,43 +1,42 @@
 import io
-from pypdf import PdfReader
+import pdfplumber
 from docx import Document
+from fastapi import UploadFile
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
 
-async def extract_text_from_file(file, filename: str) -> str:
-    """
-    Hàm hỗ trợ đọc nội dung file PDF/DOCX từ bộ nhớ (UploadFile).
-    Sử dụng pypdf và python-docx.
-    """
+async def extract_text_from_file(file: UploadFile, filename: str) -> str:
     try:
-        # 1. Đọc nội dung file vào bộ nhớ (Async read)
         content = await file.read()
-        file_stream = io.BytesIO(content)
         text = ""
 
-        # 2. Xử lý file PDF
+        # ===== PDF =====
         if filename.lower().endswith(".pdf"):
             try:
-                reader = PdfReader(file_stream)
-                for page in reader.pages:
-                    # extract_text() an toàn hơn truy cập trực tiếp bbox
-                    extracted = page.extract_text()
-                    if extracted:
-                        text += extracted + "\n"
+                with pdfplumber.open(io.BytesIO(content)) as pdf:
+                    for page in pdf.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
             except Exception as e:
-                return f"Lỗi nội tại khi đọc PDF: {str(e)}"
-        
-        # 3. Xử lý file Word (DOCX)
+                return f"Lỗi đọc PDF (pdfplumber): {str(e)}"
+
+        # ===== DOCX =====
         elif filename.lower().endswith(".docx"):
             try:
-                doc = Document(file_stream)
+                doc = Document(io.BytesIO(content))
                 for para in doc.paragraphs:
                     text += para.text + "\n"
             except Exception as e:
-                return f"Lỗi nội tại khi đọc DOCX: {str(e)}"
-        
+                return f"Lỗi đọc DOCX: {str(e)}"
+
         else:
-            return "Lỗi: Hệ thống chỉ hỗ trợ file PDF (.pdf) hoặc Word (.docx)."
+            return "Lỗi: Chỉ hỗ trợ PDF và DOCX"
+
+        if not text.strip():
+            return "Không trích xuất được nội dung từ file"
 
         return text.strip()
 
     except Exception as e:
-        return f"Lỗi không xác định khi mở file: {str(e)}"
+        return f"Lỗi hệ thống: {str(e)}"
