@@ -1,45 +1,29 @@
-from ast import List
+from typing import List  # ✅ Đã sửa lỗi chính tả (From -> from) và đúng module
 import os
 import vertexai
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import storage
-from vertexai.preview import rag  # Dùng cho các tính năng quản lý file cũ
+from vertexai.preview import rag  
 
 # --- IMPORT MODULE HIỆN TẠI (SQL + PARSER) ---
 from agent_adk import run_agent
 from file_parser import extract_text_from_file
 from vertexai.generative_models import GenerativeModel, Tool
+
 # ==================== 1. CẤU HÌNH & CREDENTIALS ====================
 PROJECT_ID = "reflecting-surf-477600-p4"
 LOCATION = "europe-west4" 
-DISPLAY_NAME = "OJT_Knowledge_Base" # Tên Corpus lưu trữ
+DISPLAY_NAME = "OJT_Knowledge_Base" 
 
 # ==================== CREDENTIALS ====================
 # 1. Đường dẫn trên Render (Secret File)
 render_secret_path = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
-
 # 2. Đường dẫn local (Cùng thư mục với main.py)
 local_key_file = "rag-service-account.json" 
 
-if os.path.exists(render_secret_path):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = render_secret_path
-    print("--- Chạy trên Deploy: Đã load Secret File ---")
-
-elif os.path.exists(local_key_file):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(local_key_file)
-    print(f"--- Chạy Local: Đã load file {local_key_file} ---")
-
-else:
-    # Nếu không thấy file nào, kiểm tra xem biến môi trường GOOGLE_APPLICATION_CREDENTIALS đã có chưa
-    if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
-        raise FileNotFoundError(
-            "KHÔNG TÌM THẤY CREDENTIALS! \n"
-            "Vui lòng để file 'rag-service-account.json' vào thư mục project."
-        )
-    print("--- Chạy Local: Sử dụng biến môi trường hệ thống ---")
-
+# Logic kiểm tra Credentials gọn gàng
 if os.path.exists(render_secret_path):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = render_secret_path
     print("--- DEPLOY MODE: Loaded Render Secret ---")
@@ -47,11 +31,16 @@ elif os.path.exists(local_key_file):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(local_key_file)
     print(f"--- LOCAL MODE: Loaded {local_key_file} ---")
 else:
-    print("--- SYSTEM MODE: Using Default Environment Credentials ---")
+    # Nếu không thấy file nào, kiểm tra xem biến môi trường hệ thống có sẵn chưa
+    if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+        print("⚠️ CẢNH BÁO: Không tìm thấy file credentials json!")
+    else:
+        print("--- SYSTEM MODE: Using Default Environment Credentials ---")
 
 # Biến toàn cục lưu trữ Corpus
 corpus = None
 model = None
+
 # ==================== 2. LIFESPAN (KHỞI ĐỘNG HỆ THỐNG) ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -74,14 +63,12 @@ async def lifespan(app: FastAPI):
         )
         
         model = GenerativeModel("gemini-2.5-pro", tools=[retrieval_tool])
-        print("Vertex AI RAG initialized successfully!")
+        print("✅ Vertex AI RAG initialized successfully!")
     except Exception as e:
-        print(f"Vertex AI initialization FAILED: {str(e)}")
-        # Không raise → server vẫn chạy, endpoint sẽ báo lỗi
+        print(f"❌ Vertex AI initialization FAILED: {str(e)}")
     
     yield  # Chạy ứng dụng
     
-    # Shutdown (nếu cần cleanup)
     print("Shutting down...")
 
 # ==================== 3. KHỞI TẠO APP ====================
@@ -115,7 +102,10 @@ async def chat_endpoint(
         # 1. Xử lý File Upload (RAM)
         if file:
             print(f"📂 Nhận file local: {file.filename}")
+            # Gọi hàm async đọc file (PDF/DOCX)
             file_text = await extract_text_from_file(file, file.filename)
+            
+            # Nếu đọc file bị lỗi thì trả về luôn
             if file_text.startswith("Lỗi"):
                 return {"answer": file_text, "sql_debug": "N/A"}
 
@@ -125,10 +115,10 @@ async def chat_endpoint(
         
         return {"answer": answer, "sql_debug": sql}
     except Exception as e:
+        print(f"Server Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== 5. CÁC API QUẢN TRỊ (Từ Code Cũ) ====================
-# Giúp bạn quản lý file trên Vertex AI Corpus (Knowledge Base lâu dài)
+# ==================== 5. CÁC API QUẢN TRỊ (Quản lý Knowledge Base) ====================
 
 def get_files_list() -> List:
     """Helper: Convert pager thành list files"""
@@ -151,35 +141,25 @@ async def status():
     except Exception as e:
         return {"status": "ERROR", "detail": str(e)}
 
-
-
 @app.post("/import_pdf")
 async def import_pdf(
     gcs_uri: str = Query(..., description="Nhập link GCS (gs://) hoặc Google Drive")
 ):
     try:
-        # 1. Bảo vệ: Kiểm tra xem RAG Corpus đã sẵn sàng chưa
         if corpus is None:
-             raise HTTPException(status_code=503, detail="RAG Corpus chưa được khởi tạo (Do vùng server hoặc lỗi mạng).")
+             raise HTTPException(status_code=503, detail="RAG Corpus chưa được khởi tạo.")
 
-        # 2. Logic cũ: Lấy danh sách file (để in log hoặc check cơ bản)
         files = get_files_list()
-        
-        # Kiểm tra file đã tồn tại chưa
         if any(gcs_uri in f.name for f in files):
             return {"message": "File đã tồn tại"}
         
-        # 3. Gọi lệnh Import (Truyền thẳng link vào, không chặn https)
         print(f"📥 Đang import: {gcs_uri}")
         rag.import_files(corpus.name, paths=[gcs_uri], chunk_size=512)
         
-        # 4. Trả kết quả
-        # Cắt lấy tên file cuối cùng để hiển thị cho đẹp
         file_name = gcs_uri.split("/")[-1]
         return {"message": f"Import thành công: {file_name}"}
 
     except Exception as e:
-        # In lỗi ra terminal để dễ debug nếu Google từ chối link
         print(f"❌ Lỗi Import: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Import error: {str(e)}")
 
@@ -198,9 +178,10 @@ async def list_files_endpoint():
         return {"files": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 @app.delete("/delete_file")
 async def delete_file(
-    resource_name: str = Query(..., description="Tên resource (projects/.../ragFiles/...) lấy từ API list_files")
+    resource_name: str = Query(..., description="Tên resource cần xóa")
 ):
     try:
         rag.delete_file(name=resource_name)
@@ -210,4 +191,5 @@ async def delete_file(
 
 if __name__ == "__main__":
     import uvicorn
+    # Chạy server
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
