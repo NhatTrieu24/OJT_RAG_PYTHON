@@ -73,7 +73,7 @@ async def lifespan(app: FastAPI):
 
 # ==================== 3. KHỞI TẠO APP ====================
 app = FastAPI(
-    title="OJT Super Assistant (SQL + RAG + Files)",
+    title="OJT Super Assistant (SQL + RAG + Files).v1",
     version="2.0 Hybrid",
     lifespan=lifespan
 )
