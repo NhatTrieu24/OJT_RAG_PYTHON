@@ -48,225 +48,190 @@ def get_query_embedding(text):
     res = get_embeddings_batch([text])
     return res[0] if res else None
 
-# ==================== 3. ĐỒNG BỘ VECTOR (PHẲNG HÓA DỮ LIỆU) ====================
+# ==================== 3. ĐỒNG BỘ VECTOR (SMART SYNC & FORCE RESET) ====================
 
-def get_existing_columns(cur, table_name):
-    try:
-        cur.execute(f'SELECT * FROM "{table_name}" LIMIT 0')
-        return [desc[0] for desc in cur.description]
-    except: return []
-
-import psycopg2
-import time
-
-def sync_missing_embeddings():
-    print("🔄 [System] Bắt đầu quy trình Phẳng hóa & Đồng bộ Vector toàn diện...")
+def sync_all_data(force_reset=False):
+    """
+    Hàm đồng bộ thông minh tích hợp Reset.
+    - force_reset=True: Xóa sạch Vector cũ để tạo lại theo cấu trúc phẳng hóa mới.
+    """
+    print(f"🔄 [System] Bắt đầu đồng bộ {'(LÀM MỚI TOÀN BỘ)' if force_reset else ''}...")
     conn = None
     try:
         conn = psycopg2.connect(dsn=DB_DSN)
         cur = conn.cursor()
-        
-        # --- 1. PHẲNG HÓA JOB_POSITION (Gộp Công ty + Kỳ học + Chuyên ngành) ---
-        print("   ∟ Xử lý: job_position (Flattened: Company, Semester, Major)")
-        sql_job = """
-            SELECT jp.job_position_id, 
-                   'Vị trí tuyển dụng: ' || COALESCE(jp.job_title, '') || 
-                   '. Tại công ty: ' || COALESCE(c.name, 'N/A') || 
-                   '. Yêu cầu: ' || COALESCE(jp.requirements, 'Không có') || 
-                   '. Quyền lợi: ' || COALESCE(jp.benefit, 'Trao đổi thêm') ||
-                   '. Địa điểm: ' || COALESCE(jp.location, 'Toàn quốc') || 
-                   '. Dành cho kỳ: ' || COALESCE(s.name, 'N/A') ||
-                   '. Thuộc ngành: ' || COALESCE(m.major_title, 'N/A') as full_text
-            FROM job_position jp
-            LEFT JOIN semester_company sc ON jp.semester_company_id = sc.semester_company_id
-            LEFT JOIN company c ON sc.company_id = c.company_id
-            LEFT JOIN semester s ON jp.semester_id = s.semester_id
-            LEFT JOIN major m ON jp.major_id = m.major_id
-            WHERE jp.embedding IS NULL;
-        """
-        process_batch_sync(cur, conn, sql_job, "job_position", "job_position_id")
 
-        # --- 2. PHẲNG HÓA OJT_DOCUMENT (Gộp Kỳ học) ---
-        print("   ∟ Xử lý: ojtdocument (Flattened: Semester)")
-        sql_ojtdoc = """
-            SELECT od.ojtdocument_id, 
-                   'Tài liệu quy định OJT: ' || COALESCE(od.title, '') || 
-                   '. Áp dụng cho kỳ học: ' || COALESCE(s.name, 'Chung') as full_text
-            FROM ojtdocument od
-            LEFT JOIN semester s ON od.semester_id = s.semester_id
-            WHERE od.embedding IS NULL;
-        """
-        process_batch_sync(cur, conn, sql_ojtdoc, "ojtdocument", "ojtdocument_id")
+        if force_reset:
+            print("⚠️ [Reset] Đang xóa sạch dữ liệu Vector và Index cũ trên tất cả bảng cốt lõi...")
+            tables_to_reset = [
+                "job_position", "company", "semester", "User", "major", 
+                "ojtdocument", "job_description", "companydocument", "job_title_overview"
+            ]
+            for table in tables_to_reset:
+                try:
+                    cur.execute(f'UPDATE "{table}" SET embedding = NULL, last_content_indexed = NULL;')
+                except: pass
+            conn.commit()
 
-        # --- 3. PHẲNG HÓA USER (Gộp Chuyên ngành + Công ty thực tập) ---
-        print("   ∟ Xử lý: User (Flattened: Major, Company)")
-        sql_user = """
-            SELECT u.user_id, 
-                   'Sinh viên: ' || COALESCE(u.fullname, '') || 
-                   '. MSSV: ' || COALESCE(u.student_code, 'N/A') ||
-                   '. Ngành học: ' || COALESCE(m.major_title, 'N/A') || 
-                   '. Công ty đang thực tập: ' || COALESCE(c.name, 'Chưa đi thực tập') as full_text
-            FROM "User" u
-            LEFT JOIN major m ON u.major_id = m.major_id
-            LEFT JOIN company c ON u.company_id = c.company_id
-            WHERE u.embedding IS NULL;
-        """
-        process_batch_sync(cur, conn, sql_user, "User", "user_id")
-
-        # --- 4. PHẲNG HÓA FINALREPORT (Gộp SV + Job + Kỳ học) ---
-        print("   ∟ Xử lý: finalreport (Flattened: Student, Job, Semester)")
-        sql_report = """
-            SELECT fr.finalreport_id,
-                   'Báo cáo cuối kỳ của SV: ' || COALESCE(u.fullname, '') ||
-                   '. Vị trí thực tập: ' || COALESCE(jp.job_title, '') ||
-                   '. Kỳ học: ' || COALESCE(s.name, '') ||
-                   '. Nội dung báo cáo: ' || COALESCE(fr.student_report_text, '') ||
-                   '. Nhận xét công ty: ' || COALESCE(fr.company_feedback, '') as full_text
-            FROM finalreport fr
-            LEFT JOIN "User" u ON fr.user_id = u.user_id
-            LEFT JOIN job_position jp ON fr.job_position_id = jp.job_position_id
-            LEFT JOIN semester s ON fr.semester_id = s.semester_id
-            WHERE fr.embedding IS NULL;
-        """
-        process_batch_sync(cur, conn, sql_report, "finalreport", "finalreport_id")
-
-        # --- 5. CÁC BẢNG DANH MỤC (Company, Major, Semester) ---
-        targets = [
-            ("company", "name", "company_id"),
-            ("semester", "name", "semester_id"),
-            ("major", "major_title", "major_id"),
-            ("companydocument", "title", "companydocument_id")
+        scenarios = [
+            {
+                "table": "job_position",
+                "id_col": "job_position_id",
+                "sql": """
+                    SELECT jp.job_position_id as id, 
+                           'THÔNG TIN TUYỂN DỤNG: Vị trí ' || COALESCE(jp.job_title, '') || 
+                           '. Tại công ty: ' || COALESCE(c.name, 'N/A') || 
+                           '. Mức lương: ' || COALESCE(jp.salary_range, 'Thỏa thuận') || 
+                           '. Yêu cầu: ' || COALESCE(jp.requirements, 'Không có') || 
+                           '. Địa điểm: ' || COALESCE(jp.location, 'N/A') as text
+                    FROM job_position jp
+                    LEFT JOIN semester_company sc ON jp.semester_company_id = sc.semester_company_id
+                    LEFT JOIN company c ON sc.company_id = c.company_id
+                """
+            },
+            {
+                "table": "ojtdocument",
+                "id_col": "ojtdocument_id",
+                "sql": "SELECT ojtdocument_id as id, 'TÀI LIỆU OJT: ' || COALESCE(title, '') || '. Link tải: ' || COALESCE(file_url, '') as text FROM ojtdocument"
+            },
+            {
+                "table": "semester",
+                "id_col": "semester_id",
+                "sql": "SELECT semester_id as id, 'LỊCH KỲ HỌC: ' || COALESCE(name, '') || '. Bắt đầu: ' || COALESCE(start_date::text, '') || '. Kết thúc: ' || COALESCE(end_date::text, '') as text FROM semester"
+            },
+            {
+                "table": "User",
+                "id_col": "user_id",
+                "sql": "SELECT user_id as id, 'HỒ SƠ: ' || COALESCE(fullname, '') || '. MSSV: ' || COALESCE(student_code, 'N/A') || '. Vai trò: ' || COALESCE(role, '') as text FROM \"User\""
+            },
+            {
+                "table": "company",
+                "id_col": "company_id",
+                "sql": "SELECT company_id as id, 'CÔNG TY: ' || COALESCE(name, '') || '. Địa chỉ: ' || COALESCE(address, '') || '. Web: ' || COALESCE(website, '') as text FROM company"
+            },
+            {
+                "table": "major",
+                "id_col": "major_id",
+                "sql": "SELECT major_id as id, 'NGÀNH HỌC: ' || COALESCE(major_title, '') || '. Mô tả: ' || COALESCE(description, '') as text FROM major"
+            }
         ]
-        for table, col, id_col in targets:
-            sql_simple = f'SELECT "{id_col}", "{col}" FROM "{table}" WHERE embedding IS NULL AND "{col}" IS NOT NULL'
-            process_batch_sync(cur, conn, sql_simple, table, id_col)
 
-        print("🎉 [System] Hoàn tất phẳng hóa toàn bộ Database.")
+        for sc in scenarios:
+            table = sc['table']
+            id_col = sc['id_col']
+            
+            sync_query = f"""
+                WITH latest_text AS ({sc['sql']})
+                SELECT lt.id, lt.text 
+                FROM latest_text lt
+                LEFT JOIN "{table}" t ON lt.id = t."{id_col}"
+                WHERE t.embedding IS NULL 
+                   OR t.last_content_indexed IS NULL 
+                   OR lt.text <> t.last_content_indexed;
+            """
+            cur.execute(sync_query)
+            rows = cur.fetchall()
+            
+            if rows:
+                print(f"   📦 Bảng [{table}]: Cập nhật {len(rows)} dòng.")
+                process_batch_sync(cur, conn, rows, table, id_col)
+            else:
+                print(f"   ✅ Bảng [{table}]: Đã đồng bộ.")
+
+        print("🎉 [System] Toàn bộ Database đã ở trạng thái mới nhất.")
     except Exception as e:
-        print(f"❌ Lỗi đồng bộ: {e}")
+        print(f"❌ Lỗi: {e}"); 
         if conn: conn.rollback()
     finally:
         if conn: conn.close()
 
-def process_batch_sync(cur, conn, sql, table_name, id_col):
-    cur.execute(sql)
-    rows = cur.fetchall()
-    if not rows: return
-    
-    print(f"      -> Cập nhật {len(rows)} dòng cho [{table_name}]")
-    ids = [r[0] for r in rows]
-    texts = [r[1] for r in rows]
-    
-    # Chia nhỏ batch 50 để tránh lỗi Rate Limit của Vertex AI
+def process_batch_sync(cur, conn, rows, table_name, id_col):
     batch_size = 50
     for i in range(0, len(rows), batch_size):
-        sub_ids = ids[i : i + batch_size]
-        sub_texts = texts[i : i + batch_size]
-        try:
-            vectors = get_embeddings_batch(sub_texts)
-            for rid, vec in zip(sub_ids, vectors):
-                cur.execute(f'UPDATE "{table_name}" SET embedding = %s WHERE "{id_col}" = %s', (vec, rid))
+        batch = rows[i : i + batch_size]
+        ids = [r[0] for r in batch]
+        texts = [r[1] for r in batch]
+        vectors = get_embeddings_batch(texts)
+        if vectors:
+            for idx, vec in enumerate(vectors):
+                cur.execute(f'UPDATE "{table_name}" SET embedding = %s, last_content_indexed = %s WHERE "{id_col}" = %s', 
+                            (vec, texts[idx], ids[idx]))
             conn.commit()
-        except Exception as e:
-            print(f"      ⚠️ Lỗi batch tại {table_name}: {e}")
-            conn.rollback()
+
 # ==================== 4. SEARCH & RAG ====================
 
-def search_vectors(question, target_table="auto", limit=5):
+def search_vectors(question, limit=10):
     query_vector = get_query_embedding(question)
     if not query_vector: return ""
-
     conn = None
     try:
         conn = psycopg2.connect(dsn=DB_DSN)
         cur = conn.cursor()
-        
         q_lower = question.lower()
-        
-        # 1. Nhận diện bảng mục tiêu
-        mapping = {
-            "semester": ["kỳ", "học kỳ", "spring", "summer", "fall", "2025"],
-            "company": ["địa chỉ", "website", "liên hệ", "văn phòng"],
-            "ojtdocument": ["ojt", "quy định", "hướng dẫn", "tài liệu"],
-            "job_position": ["việc làm", "tuyển dụng", "job", "lương", "vị trí", "momo", "fpt"]
-        }
+        threshold = 0.18 if any(k in q_lower for k in ["lương", "ngày", "mssv", "link", "url"]) else 0.25
 
-        tables_to_search = []
-        for tbl, keywords in mapping.items():
-            if any(k in q_lower for k in keywords):
-                tables_to_search.append(tbl)
-        
-        if not tables_to_search:
-            tables_to_search = ["job_position", "company", "ojtdocument"]
-
+        tables = ["job_position", "company", "ojtdocument", "semester", "major", "User"]
         final_results = []
-        for table in set(tables_to_search):
-            # --- LOGIC ĐẶC BIỆT CHO JOB_POSITION: JOIN BẮC CẦU ---
-            if table == "job_position":
-                sql = """
-                    SELECT 
-                        jp.job_title, jp.location, jp.salary_range, jp.requirements,
-                        c.name as company_name,
-                        1 - (jp.embedding <=> %s::vector) as sim
-                    FROM job_position jp
-                    LEFT JOIN semester_company sc ON jp.semester_company_id = sc.semester_company_id
-                    LEFT JOIN company c ON sc.company_id = c.company_id
-                    WHERE jp.embedding IS NULL OR jp.embedding IS NOT NULL 
-                    ORDER BY jp.embedding <=> %s::vector LIMIT %s
-                """
-                cur.execute(sql, (query_vector, query_vector, limit))
-                for r in cur.fetchall():
-                    if r[-1] > 0.20: # Ngưỡng thấp để bắt được dữ liệu liên quan MoMo
-                        final_results.append(
-                            f"[JOB] Vị trí: {r[0]} | Công ty: {r[4]} | Địa điểm: {r[1]} | "
-                            f"Lương: {r[2]} | Yêu cầu: {r[3]}"
-                        )
-            
-            # --- LOGIC CHO CÁC BẢNG KHÁC (GIỮ NGUYÊN) ---
-            else:
-                cols = get_existing_columns(cur, table)
-                if "embedding" not in cols: continue
-                d_map = {
-                    "semester": ["name", "start_date"],
-                    "company": ["name", "address", "website"],
-                    "ojtdocument": ["title", "file_url"]
-                }
-                s_cols = [c for c in d_map.get(table, []) if c in cols] or cols[:2]
-                cols_sql = ", ".join([f'"{c}"' for c in s_cols])
 
-                sql = f'SELECT {cols_sql}, 1 - (embedding <=> %s::vector) FROM "{table}" ORDER BY embedding <=> %s::vector LIMIT 3'
-                cur.execute(sql, (query_vector, query_vector))
-                for r in cur.fetchall():
-                    if r[-1] > 0.30:
-                        content = " | ".join([f"{s_cols[j]}: {r[j]}" for j in range(len(s_cols)) if r[j]])
-                        final_results.append(f"[{table.upper()}] {content}")
-
-        context_str = "\n".join(final_results)
-        print(f"🔍 [Search] Context bốc được: \n{context_str[:500]}...")
-        return context_str
-
-    except Exception as e:
-        print(f"❌ Search Error: {e}")
-        return ""
+        for table in tables:
+            sql = f'SELECT last_content_indexed, 1 - (embedding <=> %s::vector) FROM "{table}" WHERE embedding IS NOT NULL ORDER BY embedding <=> %s::vector LIMIT 5'
+            cur.execute(sql, (query_vector, query_vector))
+            for r in cur.fetchall():
+                if r[1] > threshold:
+                    final_results.append(f"[{table.upper()}] {r[0]}")
+        return "\n".join(final_results)
     finally:
         if conn: conn.close()
 
-# ==================== 5. HÀM REVIEW CV & AGENT ====================
-
 def run_agent(question: str, file_content: str = None):
     from rag_core import start_chat_session, get_chat_response
-    db_context = search_vectors(question)
-    prompt = f"DỮ LIỆU HỆ THỐNG:\n{db_context}\n\nCÂU HỎI: {question}"
-    return get_chat_response(start_chat_session(), prompt), "Mode: Clean RAG Vector"
-
+    # Nhờ AI sửa lỗi chính tả và bung viết tắt (Query Expansion)
+    
+    refine_prompt = f"""
+    Bạn là chuyên gia xử lý ngôn ngữ. Nhiệm vụ của bạn là chuẩn hóa câu hỏi của sinh viên.
+    - Bung viết tắt: tt -> thực tập, sv -> sinh viên, mssv -> mã số sinh viên, cty -> công ty, nv -> nhân viên.
+    - Giữ nguyên tên riêng/công ty: MoMo, FPT, Viettel, VNG, Shopee...
+    - Sửa lỗi chính tả và thêm dấu nếu thiếu.
+    - Nếu có từ 'mô mô', hãy hiểu đó là công ty 'MoMo'.
+    
+    Câu hỏi gốc: "{question}"
+    Câu hỏi đã chuẩn hóa (chỉ trả về nội dung câu):"""
+    
+    refine_session = start_chat_session()
+    clean_question = refine_session.send_message(refine_prompt).text.strip()
+    #-----------------------------------------------------------
+    print(f"🔍 [Refine] Gốc: {question} -> Đã sửa: {clean_question}")
+    db_context = search_vectors(clean_question)
+    prompt = f"DỮ LIỆU HỆ THỐNG:\n{db_context}\n\nCÂU HỎI: {clean_question}\n\nYÊU CẦU: CHỈ dùng dữ liệu trên. Trả lời chính xác Lương/Ngày/MSSV/URL."
+    print(f"--- DEBUG CONTEXT ---\n{db_context}")
+    return get_chat_response(start_chat_session(), prompt), "Mode: Smart Deep RAG"
+   
 def run_cv_review(cv_text: str, user_message: str):
     from rag_core import start_chat_session
-    # Khi tìm job cho CV, Vector Search sẽ tự khớp các Job đã được phẳng hóa với tên công ty
-    matched_jobs = search_vectors(cv_text, target_table="job_position", limit=3)
-    prompt = f"CV: {cv_text[:3000]}\nJob gợi ý: {matched_jobs}\nYêu cầu: {user_message}"
+    
+    # Sử dụng nội dung CV để tìm kiếm các công việc phù hợp nhất trong database
+    # Vì cv_text thường dài, search_vectors sẽ bốc ra những job có yêu cầu kỹ năng tương đồng
+    matched_jobs = search_vectors(cv_text, limit=5) 
+    
+    prompt = f"""
+    HỒ SƠ SINH VIÊN (CV): 
+    {cv_text[:3500]} 
+    
+    CÁC VỊ TRÍ TUYỂN DỤNG VÀ QUY ĐỊNH OJT TÌM THẤY: 
+    {matched_jobs}
+    
+    YÊU CẦU CỦA NGƯỜI DÙNG: {user_message}
+    
+    HƯỚNG DẪN TRẢ LỜI:
+    1. Phân tích sự phù hợp giữa kỹ năng trong CV và yêu cầu của các Job.
+    2. Đánh giá sinh viên có đủ điều kiện đi OJT theo quy định của trường không.
+    3. Trả lời bằng Tiếng Việt, trình bày rõ ràng, chuyên nghiệp. 
+    4. Nếu đủ điều kiện, hãy gợi ý vị trí khớp nhất. Nếu chưa, hãy chỉ ra kỹ năng cần bổ sung.
+    """
+    
+    print(f"--- [Mode: CV Review] Đã bốc {len(matched_jobs)} đoạn ngữ cảnh cho CV ---")
     chat_session = start_chat_session()
-    return chat_session.send_message(prompt).text, "Mode: CV Reviewer"
-
+    return chat_session.send_message(prompt).text, "Mode: CV Reviewer Intelligence"
 def check_vector_coverage():
     print("\n📊 [REPORT] KIỂM TRA ĐỘ PHỦ VECTOR")
     conn = None

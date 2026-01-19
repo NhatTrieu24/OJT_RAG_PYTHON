@@ -15,9 +15,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import storage 
 from apscheduler.schedulers.background import BackgroundScheduler
 import fitz
-from update_embeddings import sync_all_data
+from fastapi import FastAPI, BackgroundTasks
 # Import logic từ agent_adk
-from agent_adk import run_agent, run_cv_review, get_query_embedding, sync_missing_embeddings
+from agent_adk import run_agent, run_cv_review, get_query_embedding, sync_all_data
+
 from file_parser import extract_text_from_file
 
 # ==================== CẤU HÌNH ====================
@@ -105,10 +106,18 @@ def extract_text_local(file_path):
 def start_scheduler():
     """Khởi tạo trình lập lịch chạy ngầm mỗi 2 giờ"""
     scheduler = BackgroundScheduler()
-    # Thêm công việc chạy hàm sync mỗi 2 giờ
-    scheduler.add_job(sync_missing_embeddings, 'interval', hours=2)
+    
+    # 1. KHÔNG thêm dấu ngoặc () sau tên hàm.
+    # 2. Để force_reset=False để hệ thống chỉ cập nhật những gì thay đổi (Smart Update).
+    scheduler.add_job(
+        sync_all_data, 
+        'interval', 
+        hours=2, 
+        args=[False] # force_reset = False cho các lần chạy tự động
+    )
+    
     scheduler.start()
-    print("⏰ [Scheduler] Đã kích hoạt tự động đồng bộ mỗi 2 giờ.")
+    print("⏰ [Scheduler] Đã kích hoạt tự động đồng bộ THÔNG MINH mỗi 2 giờ.")
 
 # ==================== LIFESPAN & APP ====================
 @asynccontextmanager
@@ -120,7 +129,7 @@ async def lifespan(app: FastAPI):
         
         # 2. GỌI CẬP NHẬT NGAY KHI CHẠY MAIN
         print("🚀 [Main-Startup] Đang kiểm tra dữ liệu...")
-        sync_all_data()
+        sync_all_data(force_reset=True)
         
         # 2. Bắt đầu trình lập lịch định kỳ
         start_scheduler()
@@ -129,7 +138,7 @@ async def lifespan(app: FastAPI):
         print(f"❌ Startup Error: {e}")
     yield
 
-app = FastAPI(title="OJT RAG (Vector + AutoSync) V7.1", version="V2.1", lifespan=lifespan)
+app = FastAPI(title="OJT RAG (Vector + AutoSync) V7.2", version="V2.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ==================== API 1: CHAT ====================
@@ -212,7 +221,9 @@ async def delete_file(resource_name: str = Query(...)):
         if conn: conn.close()
 
 @app.get("/status")
-async def status():
+async def status(background_tasks: BackgroundTasks):
+
+    background_tasks.add_task(sync_all_data, False)
     return {
         "status": "LIVE", 
         "mode": "Vector + AutoSync + Scheduler Active",

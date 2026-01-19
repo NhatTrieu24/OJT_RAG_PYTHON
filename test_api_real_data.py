@@ -13,75 +13,64 @@ class BColors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
 
-# ================== TEST CASES THỰC TẾ ==================
+# ================== TEST CASES ĐA BẢNG (REAL DATA) ==================
 test_cases = [
-
-    # ===== NHÓM 1: THÔNG TIN DOANH NGHIỆP =====
+    # NHÓM 1: DOANH NGHIỆP & CÔNG VIỆC (Liên kết Job - Company)
     {
-        "id": "COMP_01",
-        "name": "Địa chỉ FPT Software",
-        "question": "Văn phòng của FPT Software nằm ở đâu vậy?",
-        "expected_any": ["Tố Hữu", "Hà Nội", "Hòa Lạc", "Quận 9", "Công nghệ cao"]
+        "id": "RAG_01",
+        "name": "Tuyển dụng MoMo",
+        "question": "Momo đang tuyển vị trí nào và lương bao nhiêu?",
+        "expected_any": ["Illustrator", "Cybersecurity", "100", "1000", "9000"]
+    },
+    
+    # NHÓM 2: TÀI LIỆU OJT (Bảng ojtdocument)
+    {
+        "id": "DOC_01",
+        "name": "Link tài liệu MSB",
+        "question": "Cho tôi xin link tài liệu của ngân hàng MSB",
+        "expected_any": ["drive.google.com", "MSB", "NGÂN HÀNG"]
     },
     {
-        "id": "COMP_02",
-        "name": "Website MoMo",
-        "question": "Trang web của MoMo là gì?",
-        "expected_any": ["momo.vn"]
-    },
-
-    # ===== NHÓM 2: CÔNG VIỆC & KỸ NĂNG =====
-    {
-        "id": "JOB_01",
-        "name": "Tìm job .NET",
-        "question": "Có vị trí thực tập .NET nào không?",
-        "expected_any": [".NET", "C#", "Software", "Intern", "Backend"]
-    },
-    {
-        "id": "JOB_02",
-        "name": "Yêu cầu kỹ năng React",
-        "question": "Thực tập ReactJS thì cần những gì?",
-        "expected_any": ["Javascript", "React", "Tailwind", "HTML", "CSS"]
-    },
-    {
-        "id": "JOB_03",
-        "name": "Mức lương hỗ trợ",
-        "question": "Lương hỗ trợ cho thực tập sinh BackEnd là bao nhiêu?",
-        "expected_any": ["5tr", "5.000.000", "4.000.000","500","700", "thỏa thuận","USD", "VNĐ"]
+        "id": "DOC_02",
+        "name": "Tài liệu HTV",
+        "question": "Thông tin về tài liệu của đài truyền hình HTV",
+        "expected_any": ["HTV", "ĐÀI TRUYỀN HÌNH", "drive.google.com"]
     },
 
-    # ===== NHÓM 3: TÀI LIỆU OJT (PDF) =====
-    # {
-    #     "id": "DOC_01",
-    #     "name": "Thời gian OJT",
-    #     "question": "Kỳ thực tập OJT thường kéo dài bao lâu?",
-    #     "expected_any": ["14", "15", "tuần", "tháng", "học kỳ"]
-    # },
-    # {
-    #     "id": "DOC_02",
-    #     "name": "Báo cáo thực tập",
-    #     "question": "Sinh viên có phải nộp báo cáo hàng tuần không?",
-    #     "expected_any": ["báo cáo", "weekly", "hàng tuần", "quy định", "nộp"]
-    # },
+    # NHÓM 3: THÔNG TIN SINH VIÊN & VAI TRÒ (Bảng User)
+    {
+        "id": "USER_01",
+        "name": "MSSV Teresttt",
+        "question": "Sinh viên Teresttt có mã số sinh viên là gì?",
+        "expected_any": ["S11000", "Teresttt"]
+    },
+    {
+        "id": "USER_02",
+        "name": "Vai trò Recruiter",
+        "question": "Recruiter MoMo đóng vai trò gì trong hệ thống?",
+        "expected_any": ["company", "tuyển dụng"]
+    },
 
-    # ===== NHÓM 4: KỲ HỌC & NGÀNH HỌC =====
+    # NHÓM 4: KỲ HỌC & THỜI GIAN (Bảng semester)
     {
         "id": "SEM_01",
-        "name": "Kỳ Spring 2025",
-        "question": "Khi nào thì bắt đầu kỳ Spring 2025?",
-        "expected_any": ["01/01/2025", "tháng 1", "2025"]
+        "name": "Thời gian kỳ Spring 2025",
+        "question": "Kỳ Spring 2025 bắt đầu khi nào?",
+        "expected_any": ["2025-01-01", "tháng 1"]
     },
+
+    # NHÓM 5: CHUYÊN NGÀNH (Bảng major - Kiểm tra dịch thuật)
     {
-        "id": "MAJOR_01",
-        "name": "Ngành Software Engineering",
-        "question": "Ngành Software Engineering học về cái gì?",
-        "expected_any": ["phần mềm", "hệ thống", "software", "phát triển"]
+        "id": "MAJ_01",
+        "name": "Mô tả Digital Marketing",
+        "question": "Ngành Digital Marketing học về cái gì?",
+        "expected_any": ["online marketing", "SEO", "truyền thông", "tiếp thị", "phân tích"]
     }
 ]
 
 # ================== RUN TEST ==================
 def run_tests():
-    print(f"\n{BColors.HEADER}=== STARTING REAL-DATA RAG TEST ==={BColors.ENDC}\n")
+    print(f"\n{BColors.HEADER}=== STARTING MULTI-TABLE RAG VALIDATION ==={BColors.ENDC}\n")
     passed = 0
     total = len(test_cases)
 
@@ -98,7 +87,8 @@ def run_tests():
                 data = res.json()
                 ans = data.get("answer", "")
                 
-                print(f"   🤖 AI: {ans.strip()[:150]}...") # In ngắn gọn
+                display_ans = ans.strip().replace('\n', ' ')
+                print(f"   🤖 AI: {display_ans[:150]}...") 
                 
                 ans_lower = ans.lower()
                 passed_flag = any(k.lower() in ans_lower for k in case["expected_any"])
@@ -113,14 +103,14 @@ def run_tests():
                 print(f"   ❌ Error {res.status_code}")
 
         except Exception as e:
-            print(f"   ❌ Error: {e}")
+            print(f"   ❌ Network Error: {e}")
 
-        # Rate Limit
         if idx < total - 1:
-            time.sleep(8)
+            time.sleep(5) # Giảm xuống 5s vì đã tối ưu context phẳng
 
-    print(f"\n" + "="*40)
-    print(f"🎓 KẾT QUẢ: {passed}/{total} THÀNH CÔNG")
+    print(f"\n" + "="*50)
+    print(f"{BColors.BOLD}🎓 TỔNG KẾT: {passed}/{total} CASES THÀNH CÔNG{BColors.ENDC}")
+    print("="*50 + "\n")
 
 if __name__ == "__main__":
     run_tests()
