@@ -171,39 +171,6 @@ async def chat_endpoint(question: str = Form(...), file: UploadFile = File(None)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/import_pdf")
-async def import_pdf(url: str = Query(...)):
-    temp_file = "temp_import.pdf"
-    conn = None
-    try:
-        real_filename = "Imported_Doc.pdf"
-        if "drive.google.com" in url:
-            success, fname = download_drive_file(url, temp_file)
-            if not success: return {"message": "Lỗi tải Google Drive."}
-            real_filename = fname 
-        else:
-            return {"message": "Link không hỗ trợ. Hãy dùng Google Drive link."}
-
-        content = extract_text_local(temp_file)
-        if not content: return {"message": "File rỗng hoặc không thể đọc."}
-        
-        # Tạo vector cho file mới
-        vector = get_query_embedding(content[:3000])
-        
-        conn = psycopg2.connect(dsn=DB_DSN)
-        cur = conn.cursor()
-        
-        sql = 'INSERT INTO ojtdocument (title, file_url, embedding, last_content_indexed) VALUES (%s, %s, %s, %s)'
-        cur.execute(sql, (real_filename, url, vector, content[:3000]))
-        conn.commit()
-        
-        return {"message": f"✅ Import thành công: {real_filename}", "title": real_filename}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if os.path.exists(temp_file): os.remove(temp_file)
-        if conn: conn.close()
-
 @app.get("/status")
 async def status(background_tasks: BackgroundTasks):
     # Kích hoạt Sync ngay lập tức bằng tay
