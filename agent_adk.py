@@ -1,49 +1,56 @@
 import os
+import time
 import psycopg2
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
+from dotenv import load_dotenv
 
-# ==================== CẤU HÌNH & INIT ====================
+# Nạp biến môi trường
+load_dotenv()
+
+# ==================== 1. CẤU HÌNH AUTHENTICATION ====================
 key_path = "rag-service-account.json"
 if os.path.exists(key_path):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(key_path)
 
 PROJECT_ID = os.getenv("PROJECT_ID", "reflecting-surf-477600-p4")
 LOCATION = os.getenv("LOCATION", "europe-west4")
-DB_DSN = os.getenv("DB_DSN", "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway")
+DB_DSN = os.getenv("DB_DSN")
 
 embedding_model = None
 try:
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
-    print("✅ [Agent] Vertex AI Ready.")
+    print("✅ [Agent] Vertex AI & Embedding Model Ready.")
 except Exception as e:
     print(f"⚠️ [Agent] Init Error: {e}")
 
- #==================== SYNC MISSING EMBEDDINGS ====================
-import time # Thêm import này ở đầu file
+# ==================== 2. HÀM ĐỒNG BỘ VECTOR (UPGRADED) ====================
 
 def sync_missing_embeddings():
-    """Đồng bộ Vector có cơ chế nghỉ để tránh lỗi Quota 429"""
-    print("🔄 [System] Đang kiểm tra dữ liệu mới để đồng bộ Vector...")
+    """
+    Đồng bộ Vector cho tất cả các bảng nghiệp vụ. 
+    Hệ thống sẽ tự động quét các dòng có embedding = NULL để xử lý.
+    """
+    print("🔄 [System] Bắt đầu quét dữ liệu để đồng bộ Vector...")
     conn = None
     try:
         conn = psycopg2.connect(dsn=DB_DSN)
         cur = conn.cursor()
         
-       # Thêm vào targets trong agent_adk.py
+        # Danh sách các bảng cần Vector hóa dữ liệu
         targets = [
-    ("semester", "name", "semester_id"),
-    ("major", "major_title", "major_id"),
-    ("company", "name", "company_id"),
-    ("ojtdocument", "title", "ojtdocument_id"),
-    ("job_position", "job_title", "job_position_id"),
-    ("job_description", "job_description", "job_description_id"),
-    ("finalreport", "student_report_text", "finalreport_id"),
-    ("companydocument", "title", "companydocument_id")
-                ]
+            ("semester", "name", "semester_id"),
+            ("major", "major_title", "major_id"),
+            ("company", "name", "company_id"),
+            ("ojtdocument", "title", "ojtdocument_id"),
+            ("job_position", "job_title", "job_position_id"),
+            ("job_description", "job_description", "job_description_id"),
+            ("finalreport", "student_report_text", "final_report_id"),
+            ("companydocument", "title", "company_document_id")
+        ]
         
-        updated_count = 0
+        updated_total = 0
         for table, text_col, id_col in targets:
             existing_cols = get_existing_columns(cur, table)
             
@@ -51,44 +58,49 @@ def sync_missing_embeddings():
                 cur.execute(f"SELECT {id_col}, {text_col} FROM \"{table}\" WHERE embedding IS NULL")
                 rows = cur.fetchall()
                 
+                if not rows: continue
+                
+                print(f"   ∟ Bảng [{table}]: Tìm thấy {len(rows)} dòng cần xử lý...")
                 for row_id, text in rows:
-                    if not text: continue
+                    if not text or len(str(text).strip()) < 2: continue
                     
-                    vector = get_query_embedding(text)
+                    vector = get_query_embedding(str(text))
                     if vector:
                         cur.execute(f"UPDATE \"{table}\" SET embedding = %s WHERE {id_col} = %s", (vector, row_id))
-                        updated_count += 1
+                        updated_total += 1
                         
-                        # NGHỈ 1 GIÂY giữa các request để không bị Google chặn
-                        time.sleep(1) 
+                        # Nghỉ để tránh lỗi Quota 429 của Google Cloud
+                        time.sleep(0.5) 
                         
-                        # Commit mỗi 5 dòng để đảm bảo dữ liệu được lưu dần
-                        if updated_count % 5 == 0:
+                        if updated_total % 10 == 0:
                             conn.commit()
-                            print(f"   ∟ Đã xử lý {updated_count} dòng...")
+                            print(f"      - Đã xong {updated_total} dòng...")
             
         conn.commit()
-        print(f"✅ [System] Hoàn tất! Đã cập nhật thêm {updated_count} vector.")
+        print(f"✅ [System] Hoàn tất! Tổng cộng cập nhật: {updated_total} Vector.")
             
     except Exception as e:
         print(f"❌ [System] Lỗi đồng bộ: {e}")
     finally:
         if conn: conn.close()
-# ==================== CORE FUNCTIONS ====================
+
+# ==================== 3. HÀM CORE: TẠO VECTOR & SEARCH ====================
 
 def get_query_embedding(text):
+    """Chuyển đổi văn bản thành Vector 768 chiều"""
     if not embedding_model or not text: return None
     try:
-        # Cắt ngắn text để tránh quá giới hạn token của model
-        return embedding_model.get_embeddings([text[:2000]])[0].values
+        # Cắt ngắn text để tránh lỗi Token Limit (Embedding model thường giới hạn ~2048 tokens)
+        clean_text = str(text).replace("\n", " ")[:3000]
+        embeddings = embedding_model.get_embeddings([clean_text])
+        return embeddings[0].values
     except Exception as e:
         print(f"❌ Embedding Error: {e}")
         return None
 
 def get_existing_columns(cur, table_name):
-    """Kiểm tra các cột thực tế để tránh lỗi UndefinedColumn"""
+    """Lấy danh sách cột thực tế của bảng để tránh lỗi SQL khi cấu hình thay đổi"""
     try:
-        # Sử dụng ngoặc kép để xử lý bảng có tên đặc biệt như "User"
         cur.execute(f"SELECT * FROM \"{table_name}\" LIMIT 0")
         return [desc[0] for desc in cur.description]
     except:
@@ -96,61 +108,61 @@ def get_existing_columns(cur, table_name):
 
 def search_vectors(question, target_table="auto", limit=5):
     """
-    Tìm kiếm thông minh trên nhiều bảng sử dụng PGVector.
+    Tìm kiếm ngữ nghĩa (Semantic Search) sử dụng Cosine Similarity.
     """
-    print(f"🔍 [Search] Đang tìm: '{question}'...")
+    print(f"🔍 [Search] Phân tích câu hỏi: '{question}'...")
     query_vector = get_query_embedding(question)
-    if not query_vector: 
-        return "Hệ thống đang gặp sự cố khi tạo vector tìm kiếm."
+    if not query_vector: return "Không thể tạo vector tìm kiếm."
 
     conn = None
     try:
         conn = psycopg2.connect(dsn=DB_DSN)
         cur = conn.cursor()
         
-        # 1. PHÂN LOẠI Ý ĐỊNH ĐỂ CHỌN BẢNG
+        # 1. Phân loại ý định thông minh
         tables_to_search = []
         q_lower = question.lower()
         
-        # Mapping từ khóa -> Bảng
         mapping = {
-            "ojtdocument": ["ojt", "tài liệu", "quy định", "hướng dẫn", "quy trình", "biểu mẫu", "hợp đồng"],
-            "job_position": ["job", "việc làm", "tuyển dụng", "vị trí", "thực tập", "lương", "salary", "dev", "engineer"],
-            "company": ["công ty", "địa chỉ", "website", "liên hệ", "email", "tax", "mã số thuế"],
-            "semester": ["kỳ học", "học kỳ", "semester", "spring", "summer", "fall", "bắt đầu", "kết thúc"],
-            "major": ["ngành", "chuyên ngành", "major", "học về gì"]
+            "ojtdocument": ["ojt", "quy định", "hướng dẫn", "quy trình", "biểu mẫu", "hợp đồng", "tài liệu"],
+            "job_position": ["việc làm", "tuyển dụng", "job", "lương", "salary", "vị trí", "thực tập", "dev", "engineer"],
+            "company": ["công ty", "địa chỉ", "website", "liên hệ", "mã số thuế", "tax"],
+            "semester": ["kỳ học", "semester", "spring", "summer", "fall", "thời gian", "bắt đầu"],
+            "major": ["ngành", "chuyên ngành", "major", "khối ngành"]
         }
 
-        for table, keywords in mapping.items():
-            if any(k in q_lower for k in keywords):
-                tables_to_search.append(table)
-        
-        # Nếu không bắt được từ khóa hoặc AI yêu cầu tìm bảng cụ thể
         if target_table in mapping.keys():
             tables_to_search = [target_table]
-        elif not tables_to_search:
-            tables_to_search = ["ojtdocument", "job_position", "company"]
+        else:
+            for table, keywords in mapping.items():
+                if any(k in q_lower for k in keywords):
+                    tables_to_search.append(table)
+        
+        if not tables_to_search:
+            tables_to_search = ["ojtdocument", "job_position"]
 
         final_results = []
         
-        # 2. TRUY VẤN VECTOR TRÊN CÁC BẢNG ĐÃ CHỌN
+        # 2. Truy vấn dữ liệu
         for table in tables_to_search:
-            existing_cols = get_existing_columns(cur, table)
-            if not existing_cols or "embedding" not in existing_cols:
-                continue
+            cols = get_existing_columns(cur, table)
+            if "embedding" not in cols: continue
 
-            # Ưu tiên các cột chứa thông tin quan trọng để trả về cho AI
-            priority_cols = [
-                "title", "name", "job_title", "fullname", "major_title",
-                "requirements", "address", "website", "salary_range", "start_date"
-            ]
-            valid_cols = [c for c in priority_cols if c in existing_cols]
-            if not valid_cols:
-                valid_cols = [c for c in existing_cols if c != 'embedding'][:3]
-
-            cols_sql = ", ".join([f"\"{c}\"" for c in valid_cols])
+            # Định nghĩa các cột quan trọng muốn lấy dữ liệu trả về cho AI
+            display_map = {
+                "ojtdocument": ["title", "file_url"],
+                "job_position": ["job_title", "salary_range", "location", "requirements"],
+                "company": ["name", "address", "website"],
+                "semester": ["name", "start_date", "end_date"],
+                "major": ["major_title", "major_code"]
+            }
             
-            # Câu lệnh SQL Vector Search (Cosine distance)
+            selected_cols = [c for c in display_map.get(table, cols) if c in cols]
+            if not selected_cols: selected_cols = cols[:3]
+            
+            cols_sql = ", ".join([f"\"{c}\"" for c in selected_cols])
+            
+            # Sử dụng toán tử <=> (Cosine Distance) của pgvector
             sql = f"""
                 SELECT {cols_sql}, 1 - (embedding <=> %s::vector) as similarity
                 FROM "{table}"
@@ -163,62 +175,55 @@ def search_vectors(question, target_table="auto", limit=5):
             
             for row in rows:
                 score = row[-1]
-                # Ngưỡng similarity 0.35 là mức trung bình an toàn cho Tiếng Việt
-                if score and score > 0.35:
-                    info = " | ".join([f"{valid_cols[i]}: {row[i]}" for i in range(len(valid_cols)) if row[i]])
-                    final_results.append(f"[{table.upper()}] {info} (Score: {score:.2f})")
+                if score and score > 0.38: # Ngưỡng chính xác
+                    info = " | ".join([f"{selected_cols[i]}: {row[i]}" for i in range(len(selected_cols)) if row[i]])
+                    final_results.append(f"[{table.upper()}] {info} (Khớp: {score:.2f})")
 
-        if not final_results:
-            return "HỆ THỐNG: Không tìm thấy dữ liệu liên quan trong kho lưu trữ."
-            
-        return "\n".join(final_results)
+        return "\n".join(final_results) if final_results else "KHÔNG TÌM THẤY DỮ LIỆU PHÙ HỢP."
 
     except Exception as e:
-        print(f"❌ DB Error: {e}")
-        return f"Lỗi truy vấn cơ sở dữ liệu: {str(e)}"
+        return f"Lỗi DB: {str(e)}"
     finally:
         if conn: conn.close()
 
-# ==================== LOGIC CHAT & REVIEW ====================
+# ==================== 4. LOGIC ĐIỀU PHỐI (ORCHESTRATION) ====================
 
 def run_agent(question: str, file_content: str = None):
+    """
+    Luồng xử lý RAG: Search DB -> Tạo Context -> AI trả lời
+    """
     from rag_core import start_chat_session, get_chat_response
     
-    # BƯỚC 1: Gọi Vector Search trước để lấy context từ DB
-    # Chúng ta ép hệ thống tìm kiếm trên tất cả các bảng liên quan
-    db_context = search_vectors(question, target_table="auto", limit=5)
+    # Tìm kiếm context từ Database
+    db_context = search_vectors(question)
     
-    # BƯỚC 2: Xây dựng Prompt tập trung vào dữ liệu Vector vừa tìm được
+    # Xây dựng Prompt "Siêu ngữ cảnh"
     prompt = f"""
-    Bạn là trợ lý ảo hỗ trợ học kỳ OJT. 
-    Dưới đây là thông tin thực tế được trích xuất từ hệ thống (Database):
+    Dưới đây là DỮ LIỆU THỰC TẾ từ hệ thống:
     {db_context}
-    
-    Thông tin bổ sung từ file (nếu có):
-    {file_content if file_content else "Không có file đính kèm."}
-    
-    Dựa trên các thông tin trên, hãy trả lời câu hỏi của người dùng: "{question}"
-    Lưu ý: Nếu thông tin không có trong dữ liệu được cung cấp, hãy lịch sự thông báo rằng bạn chưa có dữ liệu chính thức về vấn đề này.
+    ---
+    Dữ liệu từ file người dùng cung cấp: {file_content if file_content else "N/A"}
+    ---
+    CÂU HỎI: {question}
+    ---
+    YÊU CẦU: Dựa vào DỮ LIỆU THỰC TẾ ở trên để trả lời. Nếu không thấy thông tin trong dữ liệu, hãy nói "Tôi không tìm thấy thông tin này trong hệ thống".
     """
     
-    # BƯỚC 3: Gửi prompt đã có sẵn context cho AI
     chat_session = start_chat_session()
-    response = get_chat_response(chat_session, prompt)
-    
-    return response, "Mode: Force Vector Search"
+    return get_chat_response(chat_session, prompt), "Mode: RAG Vector Search"
+
 def run_cv_review(cv_text: str, user_message: str):
+    """Xử lý Review CV dựa trên các Job thực tế đang có"""
     from rag_core import start_chat_session
     
-    # Tìm job phù hợp với CV trong DB
     matched_jobs = search_vectors(cv_text, target_table="job_position", limit=3)
     
     prompt = f"""
-    Bạn là một chuyên gia HR. Hãy thực hiện 2 nhiệm vụ:
-    1. Nhận xét CV: {cv_text[:3000]}
-    2. Dựa vào danh sách Job sau: {matched_jobs}, hãy tư vấn vị trí phù hợp nhất.
-    3. Trả lời yêu cầu riêng của ứng viên: {user_message}
+    Bạn là HR chuyên nghiệp. Hãy phân tích CV này: {cv_text[:3000]}
+    Dựa trên các vị trí thực tế sau: {matched_jobs}
+    Hãy tư vấn cho ứng viên theo yêu cầu: {user_message}
     """
     
     chat_session = start_chat_session()
     response = chat_session.send_message(prompt)
-    return response.text, "Mode: CV Review"
+    return response.text, "Mode: CV Reviewer"
