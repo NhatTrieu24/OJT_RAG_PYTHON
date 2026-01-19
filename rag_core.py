@@ -8,7 +8,7 @@ import agent_adk  # Import file chứa hàm tìm kiếm Vector
 # ==================== 1. CẤU HÌNH DATABASE (CODE CỦA BẠN) ====================
 
 # CẤU HÌNH CHO MÁY TÍNH CỦA BẠN (LOCAL)
-LOCAL_DB_URL = "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway"
+LOCAL_DB_URL = "postgresql+psycopg2://postgres:NfVTuBOMhVKAVAqxIxZoJCTSLOiqvsgY@trolley.proxy.rlwy.net:14680/railway"
 
 # LOGIC TỰ ĐỘNG CHỌN MÔI TRƯỜNG
 if "DATABASE_URL" in os.environ:
@@ -135,12 +135,25 @@ generate_sql_func = FunctionDeclaration(
 rag_tools = Tool(
     function_declarations=[search_vectors_func, generate_sql_func],
 )
+SYSTEM_INSTRUCTION = """
+BẠN LÀ: OJT INTELLIGENT AGENT (BILINGUAL & ROBUST)
 
+NGUYÊN TẮC HOẠT ĐỘNG:
+1. ĐA NGÔN NGỮ: Phản hồi bằng ngôn ngữ người dùng hỏi (Hỏi Tiếng Việt trả lời Tiếng Việt).
+2. TRUNG THỰC: Chỉ khẳng định thông tin nếu tìm thấy trong kết quả từ 'search_vectors'.
+3. XỬ LÝ KHI THIẾU DỮ LIỆU (QUAN TRỌNG):
+   - Nếu kết quả trả về là "Không tìm thấy bất kỳ bản ghi nào...", hãy trả lời lịch sự rằng: "Hiện tại hệ thống chưa có dữ liệu chính thức về [Vấn đề người dùng hỏi]. Có thể vấn đề này chưa được cập nhật hoặc nằm ngoài phạm vi hiện tại (Ví dụ: Năm 2030 là quá xa so với dữ liệu hiện có)."
+   - TUYỆT ĐỐI KHÔNG bịa ra quy định nếu không thấy trong bảng 'ojtdocument' hoặc 'job_position'.
+
+MAPPING THÔNG MINH:
+- Luôn ưu tiên tìm kiếm theo ngữ nghĩa. Nếu người dùng viết sai (Sộp pe, Luogn, Môm), hãy dùng công cụ search_vectors với từ khóa đã được bạn tự sửa lỗi (Shopee, Lương, MoMo).
+"""
 # Khởi tạo Model với Tools
 model = GenerativeModel(
     "gemini-2.5-pro", # Hoặc gemini-1.5-flash
-    generation_config={"temperature": 0},
+    generation_config={"temperature": 0.2},
     tools=[rag_tools],
+    system_instruction=SYSTEM_INSTRUCTION
 )
 
 def start_chat_session():
