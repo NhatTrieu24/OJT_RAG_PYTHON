@@ -3,10 +3,6 @@ import time
 import psycopg2
 import vertexai
 from vertexai.language_models import TextEmbeddingModel
-from dotenv import load_dotenv
-
-# Nạp biến môi trường
-load_dotenv()
 
 # ==================== 1. CẤU HÌNH AUTHENTICATION ====================
 key_path = "rag-service-account.json"
