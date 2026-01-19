@@ -1,29 +1,38 @@
 import psycopg2
-from agent_adk import get_query_embedding, DB_DSN
+from agent_adk import get_query_embedding, DB_DSN, get_embeddings_batch
 
-def sync():
-    conn = psycopg2.connect(dsn=DB_DSN)
-    cur = conn.cursor()
-    
-    # Danh sách các bảng cần cập nhật vector
-    targets = [
-        ("job_position", "job_title", "job_position_id"),
-        ("ojtdocument", "title", "ojtdocument_id"),
-        ("major", "major_title", "major_id")
-    ]
-    
-    for table, col, id_col in targets:
-        print(f"🔄 Đang cập nhật Vector cho bảng {table}...")
-        cur.execute(f"SELECT {id_col}, {col} FROM {table} WHERE embedding IS NULL")
+def sync_all_data():
+    """Hàm này thực hiện đồng bộ toàn bộ bảng với logic Phẳng hóa"""
+    print("🔄 [Update-System] Đang bắt đầu đồng bộ dữ liệu mới...")
+    conn = None
+    try:
+        conn = psycopg2.connect(dsn=DB_DSN)
+        cur = conn.cursor()
+        
+        # Ví dụ logic phẳng hóa cho Job Position
+        sql_job = """
+            SELECT jp.job_position_id, 
+                   'Vị trí ' || COALESCE(jp.job_title, '') || ' tại ' || COALESCE(c.name, 'N/A')
+            FROM job_position jp
+            LEFT JOIN semester_company sc ON jp.semester_company_id = sc.semester_company_id
+            LEFT JOIN company c ON sc.company_id = c.company_id
+            WHERE jp.embedding IS NULL;
+        """
+        cur.execute(sql_job)
         rows = cur.fetchall()
         
-        for row_id, text in rows:
-            vector = get_query_embedding(text)
-            if vector:
-                cur.execute(f"UPDATE {table} SET embedding = %s WHERE {id_col} = %s", (vector, row_id))
-        conn.commit()
-    print("✅ Đã cập nhật xong toàn bộ Vector!")
-    conn.close()
+        if rows:
+            print(f"📦 Tìm thấy {len(rows)} dòng mới cần tạo Vector.")
+            for row_id, text in rows:
+                vector = get_query_embedding(text)
+                if vector:
+                    cur.execute("UPDATE job_position SET embedding = %s WHERE job_position_id = %s", (vector, row_id))
+            conn.commit()
+            print("✅ Cập nhật hoàn tất cho bảng Job Position.")
+        else:
+            print("✨ Không có dữ liệu mới cần cập nhật.")
 
-if __name__ == "__main__":
-    sync()
+    except Exception as e:
+        print(f"❌ Lỗi khi cập nhật: {e}")
+    finally:
+        if conn: conn.close()

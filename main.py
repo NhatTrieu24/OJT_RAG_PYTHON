@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import storage 
 from apscheduler.schedulers.background import BackgroundScheduler
 import fitz
+from update_embeddings import sync_all_data
 # Import logic từ agent_adk
 from agent_adk import run_agent, run_cv_review, get_query_embedding, sync_missing_embeddings
 from file_parser import extract_text_from_file
@@ -117,9 +118,9 @@ async def lifespan(app: FastAPI):
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         print("✅ Vertex AI initialized!")
         
-        # 1. Chạy sync ngay lập tức khi khởi động
-        print("🔄 [Startup] Đang quét dữ liệu mới từ DB...")
-        sync_missing_embeddings() 
+        # 2. GỌI CẬP NHẬT NGAY KHI CHẠY MAIN
+        print("🚀 [Main-Startup] Đang kiểm tra dữ liệu...")
+        sync_all_data()
         
         # 2. Bắt đầu trình lập lịch định kỳ
         start_scheduler()
@@ -128,7 +129,7 @@ async def lifespan(app: FastAPI):
         print(f"❌ Startup Error: {e}")
     yield
 
-app = FastAPI(title="OJT RAG (Vector + AutoSync) V7", version="V2.1", lifespan=lifespan)
+app = FastAPI(title="OJT RAG (Vector + AutoSync) V7.1", version="V2.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ==================== API 1: CHAT ====================
