@@ -7,6 +7,7 @@ import requests
 import pdfplumber
 import docx
 import time
+import threading
 from urllib.parse import unquote
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -120,6 +121,12 @@ def start_scheduler():
     print("⏰ [Scheduler] Đã kích hoạt tự động đồng bộ THÔNG MINH mỗi 2 giờ.")
 
 # ==================== LIFESPAN & APP ====================
+@app.on_event("startup")
+async def startup_event():
+    # Chạy đồng bộ dữ liệu trong một luồng riêng để không chặn việc mở Port
+    thread = threading.Thread(target=sync_all_data, args=(False,))
+    thread.start()
+    print("🚀 [Startup] Background Sync đã bắt đầu...")    
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -237,4 +244,9 @@ async def root():
         "database": "Connected"
     }
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Lấy port từ Render, nếu không có thì mặc định là 8000
+    port = int(os.environ.get("PORT", 8000))
+    
+    # Chạy uvicorn và lắng nghe trên port đó
+    # Lưu ý: host phải là "0.0.0.0" để Render có thể truy cập từ bên ngoài
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
