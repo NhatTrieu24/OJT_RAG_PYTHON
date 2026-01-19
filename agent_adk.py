@@ -11,7 +11,7 @@ if os.path.exists(key_path):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(key_path)
 
 PROJECT_ID = os.getenv("PROJECT_ID", "reflecting-surf-477600-p4")
-LOCATION = os.getenv("LOCATION", "europe-west4")
+LOCATION = os.getenv("LOCATION", "us-west1")
 DB_DSN = os.getenv("DB_DSN","postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway")
 
 embedding_model = None
