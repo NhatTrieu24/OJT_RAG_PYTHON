@@ -138,7 +138,7 @@ async def lifespan(app: FastAPI):
         print(f"❌ Startup Error: {e}")
     yield
 
-app = FastAPI(title="OJT RAG (Vector + AutoSync) V7.2", version="V2.1", lifespan=lifespan)
+app = FastAPI(title="OJT RAG (Vector + AutoSync) V7.3", version="V2.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ==================== API 1: CHAT ====================
