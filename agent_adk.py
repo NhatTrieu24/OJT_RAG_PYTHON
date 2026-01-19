@@ -5,10 +5,19 @@ import vertexai
 from vertexai.language_models import TextEmbeddingModel
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# ==================== 1. CẤU HÌNH ====================
-key_path = "rag-service-account.json"
-if os.path.exists(key_path):
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(key_path)
+# ==================== 1. CẤU HÌNH AUTHENTICATION ====================
+# Đường dẫn chuẩn cho Secret File trên Render
+render_secret = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
+local_key = "rag-service-account.json" 
+
+if os.path.exists(render_secret): 
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = render_secret
+    print("🔑 [Auth] Sử dụng Key từ Render Secrets.")
+elif os.path.exists(local_key): 
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(local_key)
+    print("🔑 [Auth] Sử dụng Key từ file Local.")
+else:
+    print("❌ [Auth] Không tìm thấy Service Account Key! AI sẽ bị lỗi xác thực.")
 
 PROJECT_ID = os.getenv("PROJECT_ID", "reflecting-surf-477600-p4")
 LOCATION = os.getenv("LOCATION", "us-west1")

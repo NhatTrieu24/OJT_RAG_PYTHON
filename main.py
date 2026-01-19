@@ -128,7 +128,7 @@ async def lifespan(app: FastAPI):
         print(f"❌ Startup Error: {e}")
     yield
 
-app = FastAPI(title="OJT RAG (Vector + AutoSync) V6", version="V2.1", lifespan=lifespan)
+app = FastAPI(title="OJT RAG (Vector + AutoSync) V7", version="V2.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ==================== API 1: CHAT ====================
@@ -217,6 +217,12 @@ async def status():
         "mode": "Vector + AutoSync + Scheduler Active",
         "next_sync_check": "Every 2 hours"
     }
-
+@app.get("/")
+async def root():
+    return {
+        "message": "OJT RAG System is Live",
+        "region": LOCATION,
+        "database": "Connected"
+    }
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
