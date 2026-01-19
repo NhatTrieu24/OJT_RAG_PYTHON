@@ -4,29 +4,26 @@ import uvicorn
 import vertexai
 import psycopg2
 import requests
-import pdfplumber
-import docx
+import io
 import time
 import threading
 from urllib.parse import unquote
 from contextlib import asynccontextmanager
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from google.cloud import storage 
 from apscheduler.schedulers.background import BackgroundScheduler
-import fitz
-from fastapi import FastAPI, BackgroundTasks
+import fitz  # PyMuPDF
+
 # Import logic từ agent_adk
 from agent_adk import run_agent, run_cv_review, get_query_embedding, sync_all_data
-
-from file_parser import extract_text_from_file
 
 # ==================== CẤU HÌNH ====================
 PROJECT_ID = "reflecting-surf-477600-p4"
 LOCATION = "us-west1" 
 DB_DSN = "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway"
 
+# Cấu hình đường dẫn Service Account
 render_secret = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
 local_key = "rag-service-account.json" 
 
@@ -84,86 +81,96 @@ def extract_text_local(file_path):
     text = ""
     try:
         if file_path.endswith(".pdf"):
-            # Mở file bằng PyMuPDF
             with fitz.open(file_path) as doc:
                 for page in doc:
-                    # Trích xuất văn bản theo khối để giữ cấu trúc tốt hơn
                     text += page.get_text("text") + "\n"
-                    
         elif file_path.endswith(".docx"):
             import docx
             doc = docx.Document(file_path)
             for p in doc.paragraphs:
                 text += p.text + "\n"
-                
     except Exception as e:
         print(f"❌ Lỗi trích xuất văn bản: {e}")
-        # Nếu lỗi nặng, trả về chuỗi rỗng để không làm hỏng logic phía sau
         return ""
-    
     return text
 
 # ==================== SCHEDULED TASK ====================
 def start_scheduler():
-    """Khởi tạo trình lập lịch chạy ngầm mỗi 2 giờ"""
     scheduler = BackgroundScheduler()
-    
-    # 1. KHÔNG thêm dấu ngoặc () sau tên hàm.
-    # 2. Để force_reset=False để hệ thống chỉ cập nhật những gì thay đổi (Smart Update).
+    # Tự động cập nhật các thay đổi mới mỗi 2 giờ (Smart Update)
     scheduler.add_job(
         sync_all_data, 
         'interval', 
         hours=2, 
-        args=[False] # force_reset = False cho các lần chạy tự động
+        args=[False] 
     )
-    
     scheduler.start()
-    print("⏰ [Scheduler] Đã kích hoạt tự động đồng bộ THÔNG MINH mỗi 2 giờ.")
+    print("⏰ [Scheduler] Đã kích hoạt tự động đồng bộ mỗi 2 giờ.")
 
-# ==================== LIFESPAN & APP ====================
-@app.on_event("startup")
-async def startup_event():
-    # Chạy đồng bộ dữ liệu trong một luồng riêng để không chặn việc mở Port
-    thread = threading.Thread(target=sync_all_data, args=(False,))
-    thread.start()
-    print("🚀 [Startup] Background Sync đã bắt đầu...")    
+# ==================== LIFESPAN ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Khởi tạo Vertex AI khi server bắt đầu
     try:
-        # Khởi tạo Vertex AI
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         print("✅ Vertex AI initialized!")
         
-        # 2. GỌI CẬP NHẬT NGAY KHI CHẠY MAIN
-        print("🚀 [Main-Startup] Đang kiểm tra dữ liệu...")
-        sync_all_data(force_reset=True)
+        # CHẠY SYNC TRONG THREAD RIÊNG: Quan trọng để Render không bị Timeout Port
+        # Để force_reset=False để tối ưu tốc độ startup
+        sync_thread = threading.Thread(target=sync_all_data, args=(False,))
+        sync_thread.start()
         
-        # 2. Bắt đầu trình lập lịch định kỳ
+        # Bắt đầu bộ lập lịch chạy ngầm
         start_scheduler()
-        
     except Exception as e:
         print(f"❌ Startup Error: {e}")
+    
     yield
+    print("👋 Server is shutting down...")
 
-app = FastAPI(title="OJT RAG (Vector + AutoSync) V7.3", version="V2.1", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# ==================== APP INITIALIZATION ====================
+app = FastAPI(title="OJT RAG Bot V7.3", version="2.1", lifespan=lifespan)
 
-# ==================== API 1: CHAT ====================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+# ==================== API ENDPOINTS ====================
+
+@app.get("/")
+async def root():
+    return {
+        "message": "OJT RAG System is Live",
+        "region": LOCATION,
+        "database": "Connected",
+        "docs": "/docs"
+    }
+
 @app.post("/chat")
 async def chat_endpoint(question: str = Form(...), file: UploadFile = File(None)):
     try:
         if file:
-            cv_text = await extract_text_from_file(file, file.filename)
-            if cv_text.startswith("Lỗi"): return {"answer": "Lỗi đọc CV.", "sql_debug": "Error"}
+            # Xử lý CV tải lên (Sử dụng hàm từ file_parser.py nếu bạn có)
+            # Ở đây giả định bạn trích xuất trực tiếp
+            content = await file.read()
+            # Tạm thời dùng fitz để đọc nội dung file tải lên trực tiếp
+            pdf_stream = io.BytesIO(content)
+            cv_text = ""
+            with fitz.open(stream=pdf_stream, filetype="pdf") as doc:
+                cv_text = " ".join([page.get_text() for page in doc])
+            
             answer, debug = run_cv_review(cv_text, question)
             return {"answer": answer, "sql_debug": debug}
         else:
+            # Trò chuyện bình thường với RAG
             answer, debug = run_agent(question)
             return {"answer": answer, "sql_debug": debug}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==================== API 2: IMPORT ====================
 @app.post("/import_pdf")
 async def import_pdf(url: str = Query(...)):
     temp_file = "temp_import.pdf"
@@ -174,21 +181,20 @@ async def import_pdf(url: str = Query(...)):
             success, fname = download_drive_file(url, temp_file)
             if not success: return {"message": "Lỗi tải Google Drive."}
             real_filename = fname 
-        elif url.startswith("gs://"):
-             return {"message": "Hiện tại ưu tiên Drive link."}
         else:
-            return {"message": "Link không hỗ trợ."}
+            return {"message": "Link không hỗ trợ. Hãy dùng Google Drive link."}
 
         content = extract_text_local(temp_file)
-        if not content: return {"message": "File rỗng."}
+        if not content: return {"message": "File rỗng hoặc không thể đọc."}
         
-        vector = get_query_embedding(content[:8000])
+        # Tạo vector cho file mới
+        vector = get_query_embedding(content[:3000])
         
         conn = psycopg2.connect(dsn=DB_DSN)
         cur = conn.cursor()
         
-        sql = "INSERT INTO ojtdocument (title, file_url, embedding) VALUES (%s, %s, %s)"
-        cur.execute(sql, (real_filename, url, vector))
+        sql = 'INSERT INTO ojtdocument (title, file_url, embedding, last_content_indexed) VALUES (%s, %s, %s, %s)'
+        cur.execute(sql, (real_filename, url, vector, content[:3000]))
         conn.commit()
         
         return {"message": f"✅ Import thành công: {real_filename}", "title": real_filename}
@@ -198,55 +204,18 @@ async def import_pdf(url: str = Query(...)):
         if os.path.exists(temp_file): os.remove(temp_file)
         if conn: conn.close()
 
-# ==================== CÁC API KHÁC ====================
-@app.get("/list_files")
-async def list_files_endpoint():
-    conn = None
-    try:
-        conn = psycopg2.connect(dsn=DB_DSN)
-        cur = conn.cursor()
-        cur.execute("SELECT ojtdocument_id, title, file_url FROM ojtdocument ORDER BY ojtdocument_id DESC")
-        rows = cur.fetchall()
-        files = [{"id": r[0], "display_name": r[1], "gcs_uri": r[2]} for r in rows]
-        return {"files": files}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn: conn.close()
-
-@app.delete("/delete_file")
-async def delete_file(resource_name: str = Query(...)):
-    conn = None
-    try:
-        conn = psycopg2.connect(dsn=DB_DSN)
-        cur = conn.cursor()
-        if resource_name.isdigit(): cur.execute("DELETE FROM ojtdocument WHERE ojtdocument_id = %s", (resource_name,))
-        else: cur.execute("DELETE FROM ojtdocument WHERE title = %s", (resource_name,))
-        conn.commit()
-        return {"message": f"Đã xóa: {resource_name}"}
-    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if conn: conn.close()
-
 @app.get("/status")
 async def status(background_tasks: BackgroundTasks):
-
+    # Kích hoạt Sync ngay lập tức bằng tay
     background_tasks.add_task(sync_all_data, False)
     return {
         "status": "LIVE", 
-        "mode": "Vector + AutoSync + Scheduler Active",
-        "next_sync_check": "Every 2 hours"
+        "mode": "Hybrid RAG + AutoSync",
+        "sync_trigger": "Manual sync started in background"
     }
-@app.get("/")
-async def root():
-    return {
-        "message": "OJT RAG System is Live",
-        "region": LOCATION,
-        "database": "Connected"
-    }
+
+# ==================== SERVER ENTRY POINT ====================
 if __name__ == "__main__":
-    # Lấy port từ Render, nếu không có thì mặc định là 8000
     port = int(os.environ.get("PORT", 8000))
-    
-    # Chạy uvicorn và lắng nghe trên port đó
-    # Lưu ý: host phải là "0.0.0.0" để Render có thể truy cập từ bên ngoài
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    # Chạy uvicorn với đối tượng app
+    uvicorn.run(app, host="0.0.0.0", port=port)
