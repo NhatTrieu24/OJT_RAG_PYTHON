@@ -8,7 +8,7 @@ import agent_adk  # Import file chứa hàm tìm kiếm Vector
 # ==================== 1. CẤU HÌNH DATABASE (CODE CỦA BẠN) ====================
 
 # CẤU HÌNH CHO MÁY TÍNH CỦA BẠN (LOCAL)
-LOCAL_DB_URL = "postgresql+psycopg2://postgres:NfVTuBOMhVKAVAqxIxZoJCTSLOiqvsgY@trolley.proxy.rlwy.net:14680/railway"
+LOCAL_DB_URL = "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway"
 
 # LOGIC TỰ ĐỘNG CHỌN MÔI TRƯỜNG
 if "DATABASE_URL" in os.environ:
