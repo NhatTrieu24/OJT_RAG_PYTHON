@@ -171,6 +171,21 @@ async def chat_endpoint(question: str = Form(...), file: UploadFile = File(None)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/list_files")
+async def list_files_endpoint():
+    conn = None
+    try:
+        conn = psycopg2.connect(dsn=DB_DSN)
+        cur = conn.cursor()
+        cur.execute('SELECT ojtdocument_id, title, file_url FROM ojtdocument ORDER BY ojtdocument_id DESC')
+        rows = cur.fetchall()
+        files = [{"id": r[0], "display_name": r[1], "gcs_uri": r[2]} for r in rows]
+        return {"files": files}
+    except Exception as e: 
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn: conn.close()
+
 @app.get("/status")
 async def status(background_tasks: BackgroundTasks):
     # Kích hoạt Sync ngay lập tức bằng tay
