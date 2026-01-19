@@ -46,7 +46,7 @@ test_cases = [
     {
         "id": "JOB_03",
         "name": "Mức lương hỗ trợ",
-        "question": "Lương hỗ trợ cho thực tập sinh là bao nhiêu?",
+        "question": "Lương hỗ trợ cho thực tập sinh BackEnd là bao nhiêu?",
         "expected_any": ["5tr", "5.000.000", "4.000.000", "thỏa thuận", "VNĐ"]
     },
 

@@ -14,7 +14,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import storage 
 from apscheduler.schedulers.background import BackgroundScheduler
-
+import fitz
 # Import logic từ agent_adk
 from agent_adk import run_agent, run_cv_review, get_query_embedding, sync_missing_embeddings
 from file_parser import extract_text_from_file
@@ -81,12 +81,23 @@ def extract_text_local(file_path):
     text = ""
     try:
         if file_path.endswith(".pdf"):
-            with pdfplumber.open(file_path) as pdf:
-                for p in pdf.pages: text += p.extract_text() or ""
+            # Mở file bằng PyMuPDF
+            with fitz.open(file_path) as doc:
+                for page in doc:
+                    # Trích xuất văn bản theo khối để giữ cấu trúc tốt hơn
+                    text += page.get_text("text") + "\n"
+                    
         elif file_path.endswith(".docx"):
+            import docx
             doc = docx.Document(file_path)
-            for p in doc.paragraphs: text += p.text + "\n"
-    except: pass
+            for p in doc.paragraphs:
+                text += p.text + "\n"
+                
+    except Exception as e:
+        print(f"❌ Lỗi trích xuất văn bản: {e}")
+        # Nếu lỗi nặng, trả về chuỗi rỗng để không làm hỏng logic phía sau
+        return ""
+    
     return text
 
 # ==================== SCHEDULED TASK ====================
@@ -117,7 +128,7 @@ async def lifespan(app: FastAPI):
         print(f"❌ Startup Error: {e}")
     yield
 
-app = FastAPI(title="OJT RAG (Vector + AutoSync) V1", version="V2.1", lifespan=lifespan)
+app = FastAPI(title="OJT RAG (Vector + AutoSync) V2", version="V2.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ==================== API 1: CHAT ====================
