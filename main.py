@@ -21,7 +21,7 @@ from file_parser import extract_text_from_file
 
 # ==================== CẤU HÌNH ====================
 PROJECT_ID = "reflecting-surf-477600-p4"
-LOCATION = "europe-west4" 
+LOCATION = "us-west1" 
 DB_DSN = "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway"
 
 render_secret = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
