@@ -144,16 +144,21 @@ NGUYÊN TẮC HOẠT ĐỘNG:
 3. XỬ LÝ KHI THIẾU DỮ LIỆU (QUAN TRỌNG):
    - Nếu kết quả trả về là "Không tìm thấy bất kỳ bản ghi nào...", hãy trả lời lịch sự rằng: "Hiện tại hệ thống chưa có dữ liệu chính thức về [Vấn đề người dùng hỏi]. Có thể vấn đề này chưa được cập nhật hoặc nằm ngoài phạm vi hiện tại (Ví dụ: Năm 2030 là quá xa so với dữ liệu hiện có)."
    - TUYỆT ĐỐI KHÔNG bịa ra quy định nếu không thấy trong bảng 'ojtdocument' hoặc 'job_position'.
-
+4. "semester": gồm các cột (semester_id, name, start_date, end_date, is_active)
+   - Lưu ý: Dùng cột "name" để tìm tên kỳ học (ví dụ: 'Spring 2025'), không dùng "semester_name".
+5. "major": gồm các cột (major_id, major_title, major_code, ...)
 MAPPING THÔNG MINH:
 - Luôn ưu tiên tìm kiếm theo ngữ nghĩa. Nếu người dùng viết sai (Sộp pe, Luogn, Môm), hãy dùng công cụ search_vectors với từ khóa đã được bạn tự sửa lỗi (Shopee, Lương, MoMo).
 """
 # Khởi tạo Model với Tools
 model = GenerativeModel(
-    "gemini-2.5-pro", # Hoặc gemini-1.5-flash
-    generation_config={"temperature": 0.2},
-    tools=[rag_tools],
-    system_instruction=SYSTEM_INSTRUCTION
+    model_name="gemini-2.5-pro", # Hoặc pro
+    generation_config={
+        "temperature": 0.2, # Giữ mức thấp để câu trả lời chính xác
+        "top_p": 0.8,
+    },
+    system_instruction="Bạn là trợ lý ảo hỗ trợ học kỳ OJT. Hãy trả lời ngắn gọn, lịch sự dựa trên dữ liệu được cung cấp."
+    # BỎ PHẦN TOOLS TẠI ĐÂY
 )
 
 def start_chat_session():

@@ -184,19 +184,28 @@ def search_vectors(question, target_table="auto", limit=5):
 def run_agent(question: str, file_content: str = None):
     from rag_core import start_chat_session, get_chat_response
     
-    # Lấy dữ liệu thực tế từ DB qua Vector Search
-    db_context = search_vectors(question)
+    # BƯỚC 1: Gọi Vector Search trước để lấy context từ DB
+    # Chúng ta ép hệ thống tìm kiếm trên tất cả các bảng liên quan
+    db_context = search_vectors(question, target_table="auto", limit=5)
     
-    # Kết hợp context từ file (nếu có) và dữ liệu từ DB
-    full_prompt = f"DỮ LIỆU TỪ DATABASE:\n{db_context}\n\n"
-    if file_content:
-        full_prompt += f"DỮ LIỆU TỪ FILE UPLOAD:\n{file_content}\n\n"
-    full_prompt += f"CÂU HỎI NGƯỜI DÙNG: {question}"
-
+    # BƯỚC 2: Xây dựng Prompt tập trung vào dữ liệu Vector vừa tìm được
+    prompt = f"""
+    Bạn là trợ lý ảo hỗ trợ học kỳ OJT. 
+    Dưới đây là thông tin thực tế được trích xuất từ hệ thống (Database):
+    {db_context}
+    
+    Thông tin bổ sung từ file (nếu có):
+    {file_content if file_content else "Không có file đính kèm."}
+    
+    Dựa trên các thông tin trên, hãy trả lời câu hỏi của người dùng: "{question}"
+    Lưu ý: Nếu thông tin không có trong dữ liệu được cung cấp, hãy lịch sự thông báo rằng bạn chưa có dữ liệu chính thức về vấn đề này.
+    """
+    
+    # BƯỚC 3: Gửi prompt đã có sẵn context cho AI
     chat_session = start_chat_session()
-    response = get_chat_response(chat_session, full_prompt)
-    return response, "Mode: Vector Search"
-
+    response = get_chat_response(chat_session, prompt)
+    
+    return response, "Mode: Force Vector Search"
 def run_cv_review(cv_text: str, user_message: str):
     from rag_core import start_chat_session
     
