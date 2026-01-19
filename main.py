@@ -6,15 +6,17 @@ import psycopg2
 import requests
 import pdfplumber
 import docx
+import time
 from urllib.parse import unquote
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import storage 
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# Import logic
-from agent_adk import run_agent, run_cv_review, get_query_embedding 
+# Import logic từ agent_adk
+from agent_adk import run_agent, run_cv_review, get_query_embedding, sync_missing_embeddings
 from file_parser import extract_text_from_file
 
 # ==================== CẤU HÌNH ====================
@@ -58,7 +60,6 @@ def download_drive_file(drive_url, destination_path):
         print(f"⬇️ Downloading Drive ID: {file_id}...")
         
         response = requests.get(url, stream=True)
-        
         filename = "Google_Drive_Doc.pdf"
         if "Content-Disposition" in response.headers:
             detected_name = get_filename_from_cd(response.headers["Content-Disposition"])
@@ -72,7 +73,6 @@ def download_drive_file(drive_url, destination_path):
                 
         print(f"✅ Saved as: {filename}")
         return True, filename
-
     except Exception as e:
         print(f"❌ Drive Error: {e}")
         return False, None
@@ -89,16 +89,35 @@ def extract_text_local(file_path):
     except: pass
     return text
 
+# ==================== SCHEDULED TASK ====================
+def start_scheduler():
+    """Khởi tạo trình lập lịch chạy ngầm mỗi 2 giờ"""
+    scheduler = BackgroundScheduler()
+    # Thêm công việc chạy hàm sync mỗi 2 giờ
+    scheduler.add_job(sync_missing_embeddings, 'interval', hours=2)
+    scheduler.start()
+    print("⏰ [Scheduler] Đã kích hoạt tự động đồng bộ mỗi 2 giờ.")
+
 # ==================== LIFESPAN & APP ====================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        # Khởi tạo Vertex AI
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         print("✅ Vertex AI initialized!")
-    except: print("❌ Vertex AI Init Failed")
+        
+        # 1. Chạy sync ngay lập tức khi khởi động
+        print("🔄 [Startup] Đang quét dữ liệu mới từ DB...")
+        sync_missing_embeddings() 
+        
+        # 2. Bắt đầu trình lập lịch định kỳ
+        start_scheduler()
+        
+    except Exception as e:
+        print(f"❌ Startup Error: {e}")
     yield
 
-app = FastAPI(title="OJT Assistant (Vector) V2", version="Final.3", lifespan=lifespan)
+app = FastAPI(title="OJT RAG (Vector + AutoSync)", version="V2.1", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ==================== API 1: CHAT ====================
@@ -123,7 +142,6 @@ async def import_pdf(url: str = Query(...)):
     conn = None
     try:
         real_filename = "Imported_Doc.pdf"
-        
         if "drive.google.com" in url:
             success, fname = download_drive_file(url, temp_file)
             if not success: return {"message": "Lỗi tải Google Drive."}
@@ -146,14 +164,13 @@ async def import_pdf(url: str = Query(...)):
         conn.commit()
         
         return {"message": f"✅ Import thành công: {real_filename}", "title": real_filename}
-
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if os.path.exists(temp_file): os.remove(temp_file)
         if conn: conn.close()
 
-# ==================== CÁC API KHÁC (FIXED SYNTAX) ====================
+# ==================== CÁC API KHÁC ====================
 @app.get("/list_files")
 async def list_files_endpoint():
     conn = None
@@ -184,7 +201,11 @@ async def delete_file(resource_name: str = Query(...)):
 
 @app.get("/status")
 async def status():
-    return {"status": "LIVE", "mode": "Vector Postgres + Fixed Syntax"}
+    return {
+        "status": "LIVE", 
+        "mode": "Vector + AutoSync + Scheduler Active",
+        "next_sync_check": "Every 2 hours"
+    }
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
