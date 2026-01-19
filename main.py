@@ -98,7 +98,7 @@ async def lifespan(app: FastAPI):
     except: print("❌ Vertex AI Init Failed")
     yield
 
-app = FastAPI(title="OJT Assistant (Vector) V1", version="Final.3", lifespan=lifespan)
+app = FastAPI(title="OJT Assistant (Vector) V2", version="Final.3", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # ==================== API 1: CHAT ====================
