@@ -33,6 +33,25 @@ elif os.path.exists(local_key):
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(local_key)
 
 # ==================== HELPER FUNCTIONS ====================
+    
+def keep_alive():
+    """Hàm tự gửi request đến chính mình (Chỉ chạy trên Render)"""
+    # Lấy URL từ biến môi trường hoặc cấu hình Render của bạn
+    RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL") 
+    
+    if not RENDER_URL:
+        print("🏠 [Keep-Alive] Đang chạy Local, bỏ qua cơ chế chống ngủ.")
+        return
+
+    time.sleep(30)
+    while True:
+        try:
+            requests.get(RENDER_URL, timeout=10)
+            print(f"⚓ [Keep-Alive] Đã gửi Ping đến {RENDER_URL}")
+        except Exception as e:
+            print(f"⚠️ [Keep-Alive] Ping failed: {e}")
+        
+        time.sleep(600) # 10 phút
 
 def get_filename_from_cd(cd):
     if not cd: return None
@@ -119,9 +138,16 @@ async def lifespan(app: FastAPI):
         # Để force_reset=False để tối ưu tốc độ startup
         sync_thread = threading.Thread(target=sync_all_data, args=(False,))
         sync_thread.start()
-        
+
+        # Chỉ chạy Keep-Alive nếu đang ở trên Render
+        if os.environ.get("RENDER"): 
+            threading.Thread(target=keep_alive, daemon=True).start()
+        else:
+            print("💻 [Local Mode] Tự động tắt tính năng Keep-Alive.")
+
         # Bắt đầu bộ lập lịch chạy ngầm
         start_scheduler()
+    
     except Exception as e:
         print(f"❌ Startup Error: {e}")
     
@@ -129,7 +155,7 @@ async def lifespan(app: FastAPI):
     print("👋 Server is shutting down...")
 
 # ==================== APP INITIALIZATION ====================
-app = FastAPI(title="OJT RAG Bot V7.3", version="2.1", lifespan=lifespan)
+app = FastAPI(title="OJT RAG Bot V7.4", version="2.1", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -187,15 +213,21 @@ async def list_files_endpoint():
         if conn: conn.close()
 
 @app.get("/status")
-async def status(background_tasks: BackgroundTasks):
-    # Kích hoạt Sync ngay lập tức bằng tay
-    background_tasks.add_task(sync_all_data, False)
+async def status():
     return {
         "status": "LIVE", 
         "mode": "Hybrid RAG + AutoSync",
         "sync_trigger": "Manual sync started in background"
     }
 
+@app.get("/SyncNow")
+async def syncNow(background_tasks: BackgroundTasks):
+    # Chuyển False thành True để ép hệ thống Reset và học lại toàn bộ dữ liệu
+    background_tasks.add_task(sync_all_data, True) 
+    return {
+        "status": "RESET & SYNCING", 
+        "message": "Hệ thống đang xóa bộ nhớ cũ và nạp lại toàn bộ dữ liệu từ Drive. Quá trình này sẽ mất vài phút..."
+    }
 # ==================== SERVER ENTRY POINT ====================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

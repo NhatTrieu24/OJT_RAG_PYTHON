@@ -256,7 +256,10 @@ def run_agent(question: str, file_content: str = None):
     - ƯU TIÊN sử dụng 'NỘI DUNG ĐỌC TRỰC TIẾP TỪ LINK DRIVE' để trả lời chi tiết các quy định OJT.
     - Sử dụng 'DỮ LIỆU HỆ THỐNG' để trả lời chính xác thông tin công ty, địa chỉ, lương, hoặc thông tin sinh viên.
     - Trình bày câu trả lời chuyên nghiệp, rõ ràng từng ý.
-    - Luôn đính kèm link tài liệu gốc ở cuối nếu có.
+    - PHẦN QUAN TRỌNG VỀ LINK: 
+       - Cuối câu trả lời, chỉ hiển thị một danh sách duy nhất các 'Link tài liệu tham khảo'.
+       - Tuyệt đối KHÔNG liệt kê lặp lại cùng một đường link.
+       - Nếu Link từ dữ liệu hệ thống và Link từ nội dung trực tiếp là một, chỉ được hiển thị 1 lần duy nhất.
     """
     
     print(f"--- DEBUG CONTEXT SENT TO AI ---\n{db_context}\n-------------------------------")
