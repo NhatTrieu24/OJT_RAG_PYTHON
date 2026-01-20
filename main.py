@@ -178,25 +178,41 @@ async def root():
 @app.post("/chat")
 async def chat_endpoint(question: str = Form(...), file: UploadFile = File(None)):
     try:
+        # TRƯỜNG HỢP 1: CÓ FILE GỬI KÈM (Lần đầu hỏi hoặc muốn phân tích file mới)
         if file:
-            # Xử lý CV tải lên (Sử dụng hàm từ file_parser.py nếu bạn có)
-            # Ở đây giả định bạn trích xuất trực tiếp
+            print(f"📄 [CV Mode] Đang xử lý: {file.filename}")
             content = await file.read()
-            # Tạm thời dùng fitz để đọc nội dung file tải lên trực tiếp
             pdf_stream = io.BytesIO(content)
+            
+            # Trích xuất văn bản từ file tải lên
             cv_text = ""
             with fitz.open(stream=pdf_stream, filetype="pdf") as doc:
                 cv_text = " ".join([page.get_text() for page in doc])
             
+            # Sử dụng model CV Analysis
             answer, debug = run_cv_review(cv_text, question)
-            return {"answer": answer, "sql_debug": debug}
+            
+            return {
+                "answer": answer, 
+                "sql_debug": debug, 
+                "active_model": "CV Analysis Mode"
+            }
+        
+        # TRƯỜNG HỢP 2: KHÔNG GỬI FILE (Lần 2 hoặc các lần hỏi bình thường)
         else:
-            # Trò chuyện bình thường với RAG
+            print("🤖 [RAG Mode] Đang sử dụng dữ liệu hệ thống.")
+            # Sử dụng model RAG mặc định (truy vấn Database)
             answer, debug = run_agent(question)
-            return {"answer": answer, "sql_debug": debug}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            
+            return {
+                "answer": answer, 
+                "sql_debug": debug, 
+                "active_model": "RAG Mode"
+            }
 
+    except Exception as e:
+        print(f"❌ Lỗi Chat: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 @app.get("/list_files")
 async def list_files_endpoint():
     conn = None
