@@ -26,7 +26,14 @@ DB_DSN = "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway"
 # Cấu hình đường dẫn Service Account
 render_secret = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
 local_key = "rag-service-account.json" 
-
+# Biến lưu trạng thái đồng bộ
+sync_status = {
+    "is_running": False,
+    "current_step": "Chưa bắt đầu",
+    "progress": "0/0",
+    "percentage": "0%",
+    "last_finished": None
+}
 if os.path.exists(render_secret): 
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = render_secret
 elif os.path.exists(local_key): 
@@ -236,14 +243,59 @@ async def status():
         "sync_trigger": "Manual sync started in background"
     }
 
+def sync_worker(force_reset: bool):
+    global sync_status
+    sync_status["is_running"] = True
+    sync_status["current_step"] = "Đang khởi tạo và xóa bộ nhớ cũ..."
+    
+    try:
+        # 1. Gọi hàm sync gốc của bạn
+        # Lưu ý: Hàm này nên được thiết kế để chạy xong mới trả về
+        sync_all_data(force_reset)
+        
+        # 2. Sau khi hàm gốc chạy xong, kiểm tra kết quả cuối cùng trong DB
+        conn = psycopg2.connect(dsn=DB_DSN)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), COUNT(embedding) FROM ojtdocument")
+        total, indexed = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        sync_status["progress"] = f"{indexed}/{total}"
+        sync_status["percentage"] = f"{(indexed/total)*100 if total > 0 else 0:.1f}%"
+        sync_status["current_step"] = "Hoàn tất đồng bộ toàn bộ dữ liệu!"
+        
+    except Exception as e:
+        sync_status["current_step"] = f"Lỗi: {str(e)}"
+    finally:
+        sync_status["is_running"] = False
+        sync_status["last_finished"] = time.strftime("%H:%M:%S %d/%m/%Y")
+
 @app.get("/SyncNow")
-async def syncNow(background_tasks: BackgroundTasks):
-    # Chuyển False thành True để ép hệ thống Reset và học lại toàn bộ dữ liệu
-    background_tasks.add_task(sync_all_data, True) 
-    return {
-        "status": "RESET & SYNCING", 
-        "message": "Hệ thống đang xóa bộ nhớ cũ và nạp lại toàn bộ dữ liệu từ Drive. Quá trình này sẽ mất vài phút..."
-    }
+async def sync_now_endpoint(background_tasks: BackgroundTasks):
+    if sync_status["is_running"]:
+        return {"message": "Đang có tiến trình chạy ngầm, vui lòng đợi."}
+    
+    background_tasks.add_task(sync_worker, True)
+    return {"message": "Đã bắt đầu Reset và Sync dữ liệu..."}
+
+@app.get("/SyncStatus")
+async def get_sync_status():
+    # Mỗi lần gọi status, ta có thể query nhanh DB để cập nhật progress thực tế
+    if sync_status["is_running"]:
+        try:
+            conn = psycopg2.connect(dsn=DB_DSN)
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*), COUNT(embedding) FROM ojtdocument")
+            total, indexed = cur.fetchone()
+            sync_status["progress"] = f"{indexed}/{total}"
+            sync_status["percentage"] = f"{(indexed/total)*100 if total > 0 else 0:.1f}%"
+            cur.close()
+            conn.close()
+        except:
+            pass # Tránh lỗi DB làm sập API status
+
+    return sync_status
 # ==================== SERVER ENTRY POINT ====================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
