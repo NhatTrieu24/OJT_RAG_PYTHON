@@ -246,31 +246,46 @@ async def status():
 def sync_worker(force_reset: bool):
     global sync_status
     sync_status["is_running"] = True
-    sync_status["current_step"] = "Đang khởi tạo và xóa bộ nhớ cũ..."
+    sync_status["current_step"] = "Đang xóa bộ nhớ cũ và quét toàn bộ các bảng..."
     
     try:
-        # 1. Gọi hàm sync gốc của bạn
-        # Lưu ý: Hàm này nên được thiết kế để chạy xong mới trả về
+        # 1. Gọi hàm sync gốc (Reset hoặc Smart Update)
         sync_all_data(force_reset)
         
-        # 2. Sau khi hàm gốc chạy xong, kiểm tra kết quả cuối cùng trong DB
+        # 2. Kiểm tra kết quả tổng hợp từ tất cả các bảng
         conn = psycopg2.connect(dsn=DB_DSN)
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), COUNT(embedding) FROM ojtdocument")
+        
+        # Truy vấn gộp để tính tổng dòng và tổng embedding của 3 bảng chính
+        query = """
+            SELECT SUM(total_count), SUM(indexed_count)
+            FROM (
+                SELECT COUNT(*) as total_count, COUNT(embedding) as indexed_count FROM ojtdocument
+                UNION ALL
+                SELECT COUNT(*), COUNT(embedding) FROM job_position
+                UNION ALL
+                SELECT COUNT(*), COUNT(embedding) FROM company
+            ) as combined_stats
+        """
+        cur.execute(query)
         total, indexed = cur.fetchone()
+        
+        # Đảm bảo không bị lỗi chia cho 0 nếu DB trống
+        total = total if total else 0
+        indexed = indexed if indexed else 0
+        
         cur.close()
         conn.close()
 
         sync_status["progress"] = f"{indexed}/{total}"
         sync_status["percentage"] = f"{(indexed/total)*100 if total > 0 else 0:.1f}%"
-        sync_status["current_step"] = "Hoàn tất đồng bộ toàn bộ dữ liệu!"
+        sync_status["current_step"] = "Hoàn tất đồng bộ toàn bộ hệ thống!"
         
     except Exception as e:
         sync_status["current_step"] = f"Lỗi: {str(e)}"
     finally:
         sync_status["is_running"] = False
         sync_status["last_finished"] = time.strftime("%H:%M:%S %d/%m/%Y")
-
 @app.get("/SyncNow")
 async def sync_now_endpoint(background_tasks: BackgroundTasks):
     if sync_status["is_running"]:
@@ -281,19 +296,30 @@ async def sync_now_endpoint(background_tasks: BackgroundTasks):
 
 @app.get("/SyncStatus")
 async def get_sync_status():
-    # Mỗi lần gọi status, ta có thể query nhanh DB để cập nhật progress thực tế
+    global sync_status
+    
+    # Nếu đang chạy, ta cập nhật con số mới nhất từ DB mỗi khi API được gọi
     if sync_status["is_running"]:
         try:
             conn = psycopg2.connect(dsn=DB_DSN)
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*), COUNT(embedding) FROM ojtdocument")
+            # Query tương tự như trên để lấy dữ liệu thực tế đang được commit vào DB
+            cur.execute("""
+                SELECT SUM(t), SUM(i) FROM (
+                    SELECT COUNT(*) as t, COUNT(embedding) as i FROM ojtdocument
+                    UNION ALL
+                    SELECT COUNT(*), COUNT(embedding) FROM job_position
+                    UNION ALL
+                    SELECT COUNT(*), COUNT(embedding) FROM company
+                ) as s
+            """)
             total, indexed = cur.fetchone()
-            sync_status["progress"] = f"{indexed}/{total}"
-            sync_status["percentage"] = f"{(indexed/total)*100 if total > 0 else 0:.1f}%"
+            sync_status["progress"] = f"{indexed if indexed else 0}/{total if total else 0}"
+            sync_status["percentage"] = f"{(indexed/total)*100 if total and total > 0 else 0:.1f}%"
             cur.close()
             conn.close()
         except:
-            pass # Tránh lỗi DB làm sập API status
+            pass 
 
     return sync_status
 # ==================== SERVER ENTRY POINT ====================
