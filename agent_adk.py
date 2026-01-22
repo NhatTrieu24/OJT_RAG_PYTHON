@@ -11,9 +11,6 @@ from contextlib import contextmanager
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_fixed
 
-# --- THƯ VIỆN AI LOCAL (QUAN TRỌNG) ---
-from sentence_transformers import SentenceTransformer
-
 load_dotenv()
 
 # ==================== 1. CẤU HÌNH HỆ THỐNG ====================
@@ -30,15 +27,19 @@ try:
 except Exception as e:
     print(f"❌ [DB] Pool Error: {e}")
 
-# 1.2 Cấu hình AI Local (Embedding)
-# Dùng model MiniLM: Nhanh, Nhẹ (300MB RAM), Vector size 384
-print("⏳ [AI Local] Đang tải Model Embedding (MiniLM)...")
-try:
-    local_embedder = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
-    print("✅ [AI Local] Model đã sẵn sàng!")
-except Exception as e:
-    print(f"❌ [AI Local] Load Model Error: {e}")
-    local_embedder = None
+# 1.2 Cấu hình AI Local (LAZY LOADING - QUAN TRỌNG CHO RENDER)
+# Không tải model ngay lập tức để tránh Timeout khi khởi động
+local_embedder = None
+
+def get_embedder():
+    """Hàm tải model 'lười' - Chỉ tải khi cần dùng"""
+    global local_embedder
+    if local_embedder is None:
+        print("⏳ [AI Local] Đang tải Model Embedding (MiniLM)...")
+        from sentence_transformers import SentenceTransformer
+        local_embedder = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+        print("✅ [AI Local] Model đã sẵn sàng!")
+    return local_embedder
 
 # ==================== 2. TỪ ĐIỂN & HÀM BỔ TRỢ ====================
 
@@ -107,16 +108,17 @@ def get_text_from_drive(file_url):
     except: pass
     return ""
 
-# ==================== 3. HÀM VECTOR LOCAL (KHÔNG TỐN QUOTA) ====================
+# ==================== 3. HÀM VECTOR LOCAL (ĐÃ SỬA LAZY LOAD) ====================
 
 def get_embeddings_batch(texts):
     """Tạo Vector bằng CPU Server (Free & Fast)"""
-    if not local_embedder or not texts: return []
+    embedder = get_embedder() # <--- Gọi hàm lazy load
+    if not embedder or not texts: return []
+    
     # Cắt ngắn text để tránh lỗi model limit
     clean_texts = [str(t).replace("\n", " ").strip()[:1000] for t in texts if t]
     try:
-        # encode trả về numpy array -> cần chuyển thành list
-        embeddings = local_embedder.encode(clean_texts)
+        embeddings = embedder.encode(clean_texts)
         return embeddings.tolist()
     except Exception as e:
         print(f"⚠️ Local Embed Error: {e}")
@@ -124,8 +126,9 @@ def get_embeddings_batch(texts):
 
 def get_query_embedding(text):
     """Tạo vector cho 1 câu hỏi"""
+    embedder = get_embedder() # <--- Gọi hàm lazy load
     try:
-        embedding = local_embedder.encode(text)
+        embedding = embedder.encode(text)
         return embedding.tolist()
     except: return None
 
@@ -169,7 +172,7 @@ def search_vectors(question):
                 cur.execute(sql_query, params)
                 
                 for r in cur.fetchall():
-                    # Lấy kết quả có khoảng cách < 0.65 (Càng nhỏ càng giống)
+                    # Lấy kết quả có khoảng cách < 0.85 (Đã nới lỏng để lấy nhiều dữ liệu hơn)
                     if r[2] < 0.85: 
                         results.append(f"[{r[0]}] {r[1]}")
                         
@@ -191,32 +194,26 @@ def run_agent(question: str, file_content: str = None):
     clean_question = quick_process_text(question)
     print(f"🧹 Input: '{question}' -> '{clean_question}'")
     
-    # 2. Tìm kiếm Vector (Lấy link file và tóm tắt)
-    # Lấy nhiều kết quả hơn chút để không bỏ sót
+    # 2. Tìm kiếm Vector
     db_context = search_vectors(clean_question) 
     
     # 3. KÍCH HOẠT ĐỌC FILE DRIVE TRỰC TIẾP (QUAN TRỌNG)
-    # Nếu trong kết quả tìm kiếm có Link Drive, ta sẽ đọc nội dung chi tiết của nó
     realtime_file_content = ""
     source_link = ""
     
     if "drive.google.com" in db_context:
-        # Tìm link đầu tiên xuất hiện trong context (thường là link liên quan nhất)
         link_match = re.search(r'https://drive\.google\.com/[^\s]+', db_context)
         if link_match:
-            target_url = link_match.group(0).rstrip(").,") # Xóa dấu câu thừa nếu có
-            print(f"🚀 [Real-time] Phát hiện tài liệu liên quan. Đang đọc chi tiết: {target_url}")
+            target_url = link_match.group(0).rstrip(").,")
+            print(f"🚀 [Real-time] Đang đọc chi tiết: {target_url}")
             
-            # Gọi hàm tải và đọc file (Mất khoảng 1-2s nhưng chi tiết cực kỳ)
             realtime_file_content = get_text_from_drive(target_url)
             
             if realtime_file_content:
                 source_link = target_url
                 print(f"   ✅ Đã trích xuất được {len(realtime_file_content)} ký tự chi tiết.")
-            else:
-                print("   ⚠️ Không đọc được nội dung file (File ảnh hoặc lỗi quyền truy cập).")
 
-    # 4. Tạo Prompt (Bơm dữ liệu chi tiết vào)
+    # 4. Tạo Prompt
     final_prompt = f"""
     VAI TRÒ: Trợ lý tuyển dụng và đào tạo OJT chuyên nghiệp.
 
@@ -236,26 +233,22 @@ def run_agent(question: str, file_content: str = None):
     YÊU CẦU TRẢ LỜI: 
     1. Dựa vào 'NỘI DUNG CHI TIẾT', hãy trích xuất toàn bộ thông tin quan trọng:
        - Giới thiệu công ty.
-       - Vị trí tuyển dụng & Yêu cầu kỹ năng (Hard/Soft skills).
+       - Vị trí tuyển dụng & Yêu cầu kỹ năng.
        - Quyền lợi (Lương, trợ cấp, môi trường).
        - Cách thức ứng tuyển (Email, Quy trình).
     2. Trình bày rõ ràng, gạch đầu dòng.
-    3. Nếu có link tài liệu gốc ({source_link}), HÃY ĐỂ NÓ Ở CUỐI CÙNG để người dùng tham khảo.
+    3. Nếu có link tài liệu gốc ({source_link}), HÃY ĐỂ NÓ Ở CUỐI CÙNG.
     """
     
-    # 5. Gửi cho AI
     try:
         chat_session = start_chat_session()
         answer = get_chat_response(chat_session, final_prompt)
     except Exception as e:
-        answer = "⚠️ Hệ thống đang bận xử lý dữ liệu lớn. Vui lòng thử lại câu hỏi cụ thể hơn."
+        answer = "⚠️ Hệ thống đang bận. Vui lòng thử lại sau."
         print(f"❌ Chat Error: {e}")
     
     print(f"⏱️ Total Time: {time.time() - t_start:.3f}s")
-    
-    # Đánh dấu mode để dễ debug
-    mode_label = "RAG Mode" if realtime_file_content else "RAG Fast Mode"
-    
+    mode_label = "RAG + Realtime" if realtime_file_content else "RAG Fast"
     return answer, mode_label
 
 # ==================== 6. ĐỒNG BỘ DỮ LIỆU (SYNC ALL) ====================
@@ -277,7 +270,7 @@ def sync_all_data(force_reset=False):
                             cur.execute(f'UPDATE "{t}" SET embedding = NULL, last_content_indexed = NULL;')
                     conn.commit()
 
-                # --- ĐỊNH NGHĨA KỊCH BẢN (GIỐNG CŨ NHƯNG CHẠY LOCAL) ---
+                # --- ĐỊNH NGHĨA KỊCH BẢN ---
                 scenarios = [
                     # 1. Job
                     {"table": "job_position", "id": "job_position_id", "sql": """
@@ -367,56 +360,39 @@ def sync_all_data(force_reset=False):
     except Exception as e:
         print(f"❌ Lỗi Sync: {e}")
 
-# ==================== 7. CV REVIEW (NÂNG CẤP) ====================
+# ==================== 7. CV REVIEW (MATCH MAKER) ====================
 
 def run_cv_review(cv_text: str, user_message: str):
     from rag_core import start_chat_session, get_chat_response
     
-    # 1. Debug xem đã đọc được nội dung CV chưa
-    print(f"📄 [CV Review] Đã đọc được: {len(cv_text)} ký tự từ CV.")
+    # 1. Debug
+    print(f"📄 [CV Review] Length: {len(cv_text)} chars.")
     if len(cv_text) < 100:
-        return "⚠️ Lỗi: Không đọc được nội dung CV (File có thể là ảnh scan hoặc bị lỗi font). Vui lòng thử file PDF khác.", "CV Error"
+        return "⚠️ Lỗi: Không đọc được CV (File ảnh hoặc lỗi).", "CV Error"
 
-    # 2. Tạo Search Query thông minh hơn
-    # Thay vì tìm nguyên văn cả CV, ta trích xuất 500 ký tự đầu (thường chứa Tech Stack) 
-    # và thêm từ khóa để ép Vector tìm về phía Job/Company thay vì tài liệu OJT.
-    search_query = cv_text[:500] + " Tìm việc làm phù hợp cho ứng viên dựa trên kỹ năng công nghệ và kinh nghiệm làm việc."
-    
-    # 3. Tìm kiếm Job trong DB
-    # (Lấy kết quả context từ hàm search_vectors có sẵn)
+    # 2. Search Job
+    search_query = cv_text[:500] + " tuyển dụng việc làm kỹ năng"
     context = search_vectors(search_query)
     
-    # 4. Prompt "Match Maker" (So khớp ứng viên & Việc làm)
+    # 3. Match Prompt
     prompt = f"""
-    VAI TRÒ: Bạn là chuyên gia HR. Nhiệm vụ là ghép đôi ứng viên với công việc phù hợp nhất.
+    VAI TRÒ: Chuyên gia HR Tech.
 
     DỮ LIỆU ĐẦU VÀO:
-    ----------------
-    1. HỒ SƠ ỨNG VIÊN (CV):
-    {cv_text[:3000]} ... (lược bớt)
+    1. CV ỨNG VIÊN: {cv_text[:3000]}
+    2. DANH SÁCH JOB: {context}
+    3. YÊU CẦU: "{user_message}"
     
-    2. DANH SÁCH VIỆC LÀM TRONG HỆ THỐNG (Database):
-    {context}
+    NHIỆM VỤ:
+    - BỎ QUA các file quy định OJT. Chỉ tập trung vào VIỆC LÀM.
+    - So sánh kỹ năng trong CV với Job.
+    - Đưa ra Top 3 Job phù hợp nhất.
     
-    3. CÂU HỎI CỦA ỨNG VIÊN: "{user_message}"
-    ----------------
-    
-    YÊU CẦU PHÂN TÍCH:
-    1. BỎ QUA các tài liệu hướng dẫn OJT (File PDF quy định). Chỉ tập trung vào [VIỆC LÀM] hoặc [DOANH NGHIỆP].
-    2. Phân tích kỹ năng cứng (Hard Skills) trong CV (VD: Java, React, Python, SQL...).
-    3. So sánh với "Yêu cầu" (Requirements) của các Job tìm thấy.
-    4. Đưa ra Top 3 công ty/vị trí phù hợp nhất.
-    
-    ĐỊNH DẠNG TRẢ LỜI (Bắt buộc):
-    🎯 **Top 1: [Tên Vị Trí] - [Tên Công Ty]**
-       - 💡 Độ phù hợp: [Cao/Khá]
-       - ✅ Lý do match: [Kỹ năng nào trong CV khớp với Job?]
-       - ⚠️ Cần bổ sung: [Job yêu cầu gì mà CV chưa có?]
-
-    🎯 **Top 2: ...**
-    
-    (Nếu không tìm thấy Job nào phù hợp, hãy đưa ra lời khuyên cải thiện CV dựa trên thị trường).
+    ĐỊNH DẠNG:
+    🎯 **Top 1: [Vị Trí] - [Công Ty]**
+       - ✅ Lý do match: ...
+       - ⚠️ Cần bổ sung: ...
     """
     
-    print("🤖 [CV Review] Đang phân tích độ phù hợp...")
-    return get_chat_response(start_chat_session(), prompt), "CV Reviewer Intelligence"
+    print("🤖 [CV Review] Matching...")
+    return get_chat_response(start_chat_session(), prompt), "CV Matcher"
