@@ -1,284 +1,422 @@
 import os
-import time
-import psycopg2
-import vertexai
-from vertexai.language_models import TextEmbeddingModel
-from tenacity import retry, stop_after_attempt, wait_exponential
-import io
-import requests
-import pdfplumber
 import re
-import docx  # Thư viện đọc file Word (.docx)
+import io
+import time
+import requests
+import psycopg2
+from psycopg2 import pool
+import pdfplumber
+import docx
+from contextlib import contextmanager
+from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_fixed
 
-# ==================== 1. CẤU HÌNH AUTHENTICATION ====================
-render_secret = "/etc/secrets/GCP_SERVICE_ACCOUNT_JSON"
-local_key = "rag-service-account.json" 
+# --- THƯ VIỆN AI LOCAL (QUAN TRỌNG) ---
+from sentence_transformers import SentenceTransformer
 
-if os.path.exists(render_secret): 
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = render_secret
-    print("🔑 [Auth] Sử dụng Key từ Render Secrets.")
-elif os.path.exists(local_key): 
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(local_key)
-    print("🔑 [Auth] Sử dụng Key từ file Local.")
-else:
-    print("❌ [Auth] Không tìm thấy Service Account Key!")
+load_dotenv()
 
-PROJECT_ID = os.getenv("PROJECT_ID", "reflecting-surf-477600-p4")
-LOCATION = os.getenv("LOCATION", "us-west1")
-DB_DSN = os.getenv("DB_DSN", "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway")
+# ==================== 1. CẤU HÌNH HỆ THỐNG ====================
 
-embedding_model = None
+# 1.1 Cấu hình Database & Connection Pool
+LOCAL_DB_URL = "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway"
+DB_DSN = os.environ.get("DB_DSN", LOCAL_DB_URL)
+
+db_pool = None
 try:
-    vertexai.init(project=PROJECT_ID, location=LOCATION)
-    embedding_model = TextEmbeddingModel.from_pretrained("text-embedding-004")
-    print("✅ [Agent] Vertex AI & Embedding Model Ready.")
+    # Tạo bể kết nối (Min 1, Max 10) để tránh mở lại connection liên tục
+    db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=DB_DSN)
+    print("✅ [DB] Connection Pool initialized.")
 except Exception as e:
-    print(f"⚠️ [Agent] Init Error: {e}")
+    print(f"❌ [DB] Pool Error: {e}")
 
-# ==================== 2. HÀM BỔ TRỢ (DRIVE & EMBEDDING) ====================
+# 1.2 Cấu hình AI Local (Embedding)
+# Dùng model MiniLM: Nhanh, Nhẹ (300MB RAM), Vector size 384
+print("⏳ [AI Local] Đang tải Model Embedding (MiniLM)...")
+try:
+    local_embedder = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+    print("✅ [AI Local] Model đã sẵn sàng!")
+except Exception as e:
+    print(f"❌ [AI Local] Load Model Error: {e}")
+    local_embedder = None
+
+# ==================== 2. TỪ ĐIỂN & HÀM BỔ TRỢ ====================
+
+# Từ điển viết tắt (Regex) - Nhanh hơn gọi AI gấp 1000 lần
+ABBREVIATIONS = {
+    r"\btt\b": "thực tập",
+    r"\bojt\b": "thực tập doanh nghiệp",
+    r"\bmssv\b": "mã số sinh viên",
+    r"\bcv\b": "hồ sơ xin việc",
+    r"\bcty\b": "công ty",
+    r"\bdn\b": "doanh nghiệp",
+    r"\bsem\b": "học kỳ",
+    r"\bjob\b": "việc làm",
+    r"\bluong\b": "mức lương",
+    r"\bhcm\b": "TP.HCM",
+    r"\bhn\b": "Hà Nội"
+}
+
+def quick_process_text(text):
+    """Chuẩn hóa text siêu tốc bằng Regex"""
+    if not text: return ""
+    text = text.lower().strip()
+    for pattern, replacement in ABBREVIATIONS.items():
+        text = re.sub(pattern, replacement, text)
+    return re.sub(r'\s+', ' ', text)
+
+@contextmanager
+def get_db_connection():
+    """Lấy kết nối từ Pool an toàn"""
+    conn = None
+    try:
+        if db_pool:
+            conn = db_pool.getconn()
+            yield conn
+        else:
+            conn = psycopg2.connect(dsn=DB_DSN)
+            yield conn
+    except Exception as e:
+        print(f"❌ DB Error: {e}")
+        raise e
+    finally:
+        if conn and db_pool: db_pool.putconn(conn)
+        elif conn: conn.close()
 
 def get_text_from_drive(file_url):
+    """Tải và đọc nội dung file PDF/Word từ Google Drive"""
     if not file_url or "drive.google.com" not in file_url: return ""
     try:
-        # Tách ID file
-        file_id = re.search(r'[-\w]{25,}', file_url).group()
-        # Sử dụng link download trực tiếp của Google
-        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+        match = re.search(r'/d/([a-zA-Z0-9_-]+)', file_url) or re.search(r'id=([a-zA-Z0-9_-]+)', file_url)
+        if not match: return ""
+        url = f"https://drive.google.com/uc?export=download&id={match.group(1)}"
         
-        response = requests.get(download_url, timeout=20, allow_redirects=True)
-        if response.status_code == 200:
-            stream = io.BytesIO(response.content)
-            # Thử đọc PDF
+        # Timeout 10s để không treo server
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200:
+            stream = io.BytesIO(res.content)
             try:
+                # Ưu tiên đọc PDF
                 with pdfplumber.open(stream) as pdf:
-                    return " ".join([p.extract_text() for p in pdf.pages[:5] if p.extract_text()])
-            except:
-                # Nếu không phải PDF, thử đọc Word
+                    return " ".join([p.extract_text() or "" for p in pdf.pages[:5]])
+            except: 
+                # Fallback sang Word
                 stream.seek(0)
                 doc = docx.Document(stream)
                 return " ".join([p.text for p in doc.paragraphs])
-    except Exception as e:
-        print(f"❌ Lỗi đọc link: {e}")
+    except: pass
     return ""
 
+# ==================== 3. HÀM VECTOR LOCAL (KHÔNG TỐN QUOTA) ====================
 
-
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=5, min=10, max=120))
 def get_embeddings_batch(texts):
-    if not embedding_model or not texts: return []
-    # Làm sạch text để tối ưu TPM (Tokens Per Minute)
-    clean_texts = [str(t).replace("\n", " ").strip()[:2500] for t in texts if t]
-    if not clean_texts: return []
+    """Tạo Vector bằng CPU Server (Free & Fast)"""
+    if not local_embedder or not texts: return []
+    # Cắt ngắn text để tránh lỗi model limit
+    clean_texts = [str(t).replace("\n", " ").strip()[:1000] for t in texts if t]
     try:
-        embeddings = embedding_model.get_embeddings(clean_texts)
-        return [e.values for e in embeddings]
+        # encode trả về numpy array -> cần chuyển thành list
+        embeddings = local_embedder.encode(clean_texts)
+        return embeddings.tolist()
     except Exception as e:
-        print(f"⚠️ API Warning: {e}. Đang đợi hồi Quota...")
-        raise e
+        print(f"⚠️ Local Embed Error: {e}")
+        return []
 
 def get_query_embedding(text):
-    res = get_embeddings_batch([text])
-    return res[0] if res else None
-
-# ==================== 3. ĐỒNG BỘ VECTOR THÔNG MINH (BATCH MODE) ====================
-
-def sync_all_data(force_reset=False):
-    print(f"🔄 [System] Bắt đầu đồng bộ thông minh (BATCH MODE - PDF & Word)...")
-    conn = None
+    """Tạo vector cho 1 câu hỏi"""
     try:
-        conn = psycopg2.connect(dsn=DB_DSN)
-        cur = conn.cursor()
+        embedding = local_embedder.encode(text)
+        return embedding.tolist()
+    except: return None
 
-        if force_reset:
-            print("⚠️ [Reset] Đang Reset toàn bộ bộ nhớ Vector...")
-            tables = ["job_position", "company", "semester", "User", "major", "ojtdocument"]
-            for t in tables:
-                cur.execute(f'UPDATE "{t}" SET embedding = NULL, last_content_indexed = NULL;')
-            conn.commit()
+# ==================== 4. SEARCH ENGINE (TỐI ƯU HÓA) ====================
 
-        scenarios = [
-            {
-                "table": "job_position",
-                "id_col": "job_position_id",
-                "sql": """
-                    SELECT jp.job_position_id, 
-                           'VỊ TRÍ: ' || COALESCE(jp.job_title, '') || '. CÔNG TY: ' || COALESCE(c.name, 'N/A') || 
-                           '. YÊU CẦU: ' || COALESCE(jp.requirements, 'Không có') as text
-                    FROM job_position jp
-                    LEFT JOIN semester_company sc ON jp.semester_company_id = sc.semester_company_id
-                    LEFT JOIN company c ON sc.company_id = c.company_id
-                """
-            },
-            {
-                "table": "ojtdocument",
-                "id_col": "ojtdocument_id",
-                "sql": "SELECT ojtdocument_id, title, file_url FROM ojtdocument"
-            },
-            {
-                "table": "semester",
-                "id_col": "semester_id",
-                "sql": "SELECT semester_id, 'LỊCH KỲ HỌC: ' || COALESCE(name, '') as text FROM semester"
-            },
-            {
-                "table": "User",
-                "id_col": "user_id",
-                "sql": "SELECT user_id, 'HỒ SƠ: ' || COALESCE(fullname, '') as text FROM \"User\""
-            },
-            {
-                "table": "company",
-                "id_col": "company_id",
-                "sql": "SELECT company_id, 'CÔNG TY: ' || COALESCE(name, '') as text FROM company"
-            },
-            {
-                "table": "major",
-                "id_col": "major_id",
-                "sql": "SELECT major_id, 'NGÀNH HỌC: ' || COALESCE(major_title, '') as text FROM major"
-            }
-        ]
-
-        for sc in scenarios:
-            table = sc['table']
-            cur.execute(f"""
-                WITH latest AS ({sc['sql']})
-                SELECT l.* FROM latest l
-                LEFT JOIN "{table}" t ON l.{sc['id_col']} = t."{sc['id_col']}"
-                WHERE t.embedding IS NULL OR t.last_content_indexed IS NULL;
-            """)
-            rows = cur.fetchall()
-
-            if rows:
-                print(f"📦 Bảng [{table}]: Phát hiện {len(rows)} dòng cần xử lý.")
-                batch_texts, batch_ids = [], []
-
-                for r in rows:
-                    rid = r[0]
-                    if table == "ojtdocument":
-                        title = r[1] if len(r) > 1 else "Tài liệu"
-                        url = r[2] if len(r) > 2 else ""
-                        print(f"  📥 Trích xuất PDF/Word: {title}")
-                        content = get_text_from_drive(url)
-                        final_text = f"TÀI LIỆU OJT: {title}. NỘI DUNG: {content}. Link: {url}"
-                    else:
-                        final_text = r[1]
-                    
-                    batch_texts.append(final_text)
-                    batch_ids.append(rid)
-
-                # Batch 5 dòng để tối ưu Quota
-                sub_batch_size = 5
-                for i in range(0, len(batch_texts), sub_batch_size):
-                    s_texts = batch_texts[i : i + sub_batch_size]
-                    s_ids = batch_ids[i : i + sub_batch_size]
-                    
-                    print(f"📡 Đang gửi batch {i//sub_batch_size + 1} lên Vertex AI...")
-                    vectors = get_embeddings_batch(s_texts)
-                    
-                    if vectors:
-                        for idx, vec in enumerate(vectors):
-                            cur.execute(f'UPDATE "{table}" SET embedding = %s, last_content_indexed = %s WHERE "{sc["id_col"]}" = %s', 
-                                       (vec, s_texts[idx], s_ids[idx]))
-                        conn.commit()
-                        print(f"  ✅ Đã lưu {len(vectors)} dòng. Nghỉ 5s...")
-                        time.sleep(5)
-            else:
-                print(f"✅ Bảng [{table}]: Đã đồng bộ.")
-
-        print("🎉 [System] Hoàn tất đồng bộ toàn bộ dữ liệu.")
-    except Exception as e:
-        print(f"❌ Lỗi Sync: {e}"); conn.rollback() if conn else None
-    finally:
-        if conn: conn.close()
-
-# ==================== 4. CORE RAG LOGIC ====================
-
-def search_vectors(question, limit=7):
+def search_vectors(question):
+    t0 = time.time()
+    
+    # 1. Tạo vector câu hỏi (Local)
     query_vector = get_query_embedding(question)
     if not query_vector: return ""
-    conn = None
+    
+    results = []
     try:
-        conn = psycopg2.connect(dsn=DB_DSN)
-        cur = conn.cursor()
-        results = []
-        for t in ["ojtdocument", "job_position", "company", "semester"]:
-            cur.execute(f'SELECT last_content_indexed, 1 - (embedding <=> %s::vector) as score FROM "{t}" WHERE embedding IS NOT NULL ORDER BY score DESC LIMIT 3', (query_vector,))
-            for r in cur.fetchall():
-                if r[1] > 0.18: 
-                    results.append(f"[{t.upper()}] {r[0]}")
-        return "\n".join(results)
-    finally:
-        if conn: conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # 2. Query tối ưu (Gộp 9 bảng)
+                # Lưu ý: DB Vector cột phải là vector(384)
+                sql_query = """
+                    (SELECT 'TÀI LIỆU', last_content_indexed, (embedding <=> %s::vector) as d FROM ojtdocument WHERE embedding IS NOT NULL ORDER BY d ASC LIMIT 3)
+                    UNION ALL
+                    (SELECT 'VIỆC LÀM', last_content_indexed, (embedding <=> %s::vector) as d FROM job_position WHERE embedding IS NOT NULL ORDER BY d ASC LIMIT 4)
+                    UNION ALL
+                    (SELECT 'DOANH NGHIỆP', last_content_indexed, (embedding <=> %s::vector) as d FROM company WHERE embedding IS NOT NULL ORDER BY d ASC LIMIT 2)
+                    UNION ALL
+                    (SELECT 'HỒ SƠ SV', last_content_indexed, (embedding <=> %s::vector) as d FROM "User" WHERE embedding IS NOT NULL ORDER BY d ASC LIMIT 2)
+                    UNION ALL
+                    (SELECT 'NGÀNH HỌC', last_content_indexed, (embedding <=> %s::vector) as d FROM major WHERE embedding IS NOT NULL ORDER BY d ASC LIMIT 2)
+                    UNION ALL
+                    (SELECT 'HỌC KỲ', last_content_indexed, (embedding <=> %s::vector) as d FROM semester WHERE embedding IS NOT NULL ORDER BY d ASC LIMIT 1)
+                    UNION ALL
+                    (SELECT 'DOC CÔNG TY', last_content_indexed, (embedding <=> %s::vector) as d FROM companydocument WHERE embedding IS NOT NULL ORDER BY d ASC LIMIT 2)
+                    UNION ALL
+                    (SELECT 'FEEDBACK', last_content_indexed, (embedding <=> %s::vector) as d FROM finalreport WHERE embedding IS NOT NULL ORDER BY d ASC LIMIT 2)
+                    UNION ALL
+                    (SELECT 'THỐNG KÊ', last_content_indexed, (embedding <=> %s::vector) as d FROM job_title_overview WHERE embedding IS NOT NULL ORDER BY d ASC LIMIT 2)
+                    ORDER BY d ASC LIMIT 12
+                """
+                # Truyền tham số 9 lần cho 9 dấu %s
+                params = (query_vector,) * 9 
+                cur.execute(sql_query, params)
+                
+                for r in cur.fetchall():
+                    # Lấy kết quả có khoảng cách < 0.65 (Càng nhỏ càng giống)
+                    if r[2] < 0.85: 
+                        results.append(f"[{r[0]}] {r[1]}")
+                        
+    except Exception as e:
+        print(f"❌ Search Error: {e}")
+    
+    print(f"⚡ Local Search: {time.time() - t0:.3f}s")
+    return "\n\n".join(results)
+
+# ==================== 5. CORE RAG LOGIC ====================
 
 def run_agent(question: str, file_content: str = None):
+    # Import cục bộ để tránh lỗi circular import
     from rag_core import start_chat_session, get_chat_response
-    import re
-    import psycopg2
     
-    clean_question = question
-    # 1. AI Refiner: Bung viết tắt (tt, mssv) nhưng giữ nguyên tên riêng
-    abbr_patterns = [r'\btt\b', r'\bmssv\b', r'\bmô mô\b']
-    if len(question.split()) < 5 or any(re.search(p, question.lower()) for p in abbr_patterns):
-        refine_p = f"Chuẩn hóa câu hỏi: '{question}'. Bung viết tắt (tt=thực tập, mssv=mã số sinh viên). Giữ nguyên tên riêng. Chỉ trả về câu đã sửa."
-        try:
-            clean_question = start_chat_session().send_message(refine_p).text.strip()
-            print(f"🔍 [Refine] {question} -> {clean_question}")
-        except:
-            clean_question = question
-
-    # 2. Lấy Context từ Vector Search (Truy vấn đa bảng: job, company, user...)
-    db_context = search_vectors(clean_question)
+    t_start = time.time()
     
-    # 3. Xử lý đọc nội dung Link Drive trực tiếp (Nếu câu hỏi liên quan đến tài liệu OJT)
-    drive_content = ""
-    target_link = ""
-    # Tìm xem trong db_context có chứa link ojtdocument không
-    if "[OJTDOCUMENT]" in db_context.upper():
-        # Trích xuất link drive từ context bằng Regex
+    # 1. Xử lý câu hỏi
+    clean_question = quick_process_text(question)
+    print(f"🧹 Input: '{question}' -> '{clean_question}'")
+    
+    # 2. Tìm kiếm Vector (Lấy link file và tóm tắt)
+    # Lấy nhiều kết quả hơn chút để không bỏ sót
+    db_context = search_vectors(clean_question) 
+    
+    # 3. KÍCH HOẠT ĐỌC FILE DRIVE TRỰC TIẾP (QUAN TRỌNG)
+    # Nếu trong kết quả tìm kiếm có Link Drive, ta sẽ đọc nội dung chi tiết của nó
+    realtime_file_content = ""
+    source_link = ""
+    
+    if "drive.google.com" in db_context:
+        # Tìm link đầu tiên xuất hiện trong context (thường là link liên quan nhất)
         link_match = re.search(r'https://drive\.google\.com/[^\s]+', db_context)
         if link_match:
-            target_link = link_match.group(0)
-            print(f"📂 AI đang truy cập trực tiếp link để lấy nội dung chi tiết: {target_link}")
-            drive_content = get_text_from_drive(target_link)
+            target_url = link_match.group(0).rstrip(").,") # Xóa dấu câu thừa nếu có
+            print(f"🚀 [Real-time] Phát hiện tài liệu liên quan. Đang đọc chi tiết: {target_url}")
+            
+            # Gọi hàm tải và đọc file (Mất khoảng 1-2s nhưng chi tiết cực kỳ)
+            realtime_file_content = get_text_from_drive(target_url)
+            
+            if realtime_file_content:
+                source_link = target_url
+                print(f"   ✅ Đã trích xuất được {len(realtime_file_content)} ký tự chi tiết.")
+            else:
+                print("   ⚠️ Không đọc được nội dung file (File ảnh hoặc lỗi quyền truy cập).")
 
-    # 4. Xây dựng Prompt tổng hợp
+    # 4. Tạo Prompt (Bơm dữ liệu chi tiết vào)
     final_prompt = f"""
-    DỮ LIỆU HỆ THỐNG (BẮT BUỘC SỬ DỤNG):
-    {db_context if db_context else "Không tìm thấy dữ liệu liên quan trong DB."}
+    VAI TRÒ: Trợ lý tuyển dụng và đào tạo OJT chuyên nghiệp.
+
+    DỮ LIỆU TÓM TẮT TỪ HỆ THỐNG:
+    {db_context}
     
-    NỘI DUNG ĐỌC TRỰC TIẾP TỪ LINK DRIVE (NẾU CÓ):
-    {drive_content if drive_content else "Không có nội dung bổ sung từ link."}
+    --------------------------------------------------
+    NỘI DUNG CHI TIẾT ĐẦY ĐỦ TỪ TÀI LIỆU (ƯU TIÊN DÙNG CÁI NÀY):
+    {realtime_file_content if realtime_file_content else "Không đọc được nội dung chi tiết file."}
+    --------------------------------------------------
     
-    FILE NGƯỜI DÙNG TẢI LÊN (NẾU CÓ): 
+    FILE NGƯỜI DÙNG TẢI LÊN (NẾU CÓ):
     {file_content if file_content else "N/A"}
     
     CÂU HỎI: {clean_question}
     
-    YÊU CẦU:
-    - ƯU TIÊN sử dụng 'NỘI DUNG ĐỌC TRỰC TIẾP TỪ LINK DRIVE' để trả lời chi tiết các quy định OJT.
-    - Sử dụng 'DỮ LIỆU HỆ THỐNG' để trả lời chính xác thông tin công ty, địa chỉ, lương, hoặc thông tin sinh viên.
-    - Trình bày câu trả lời chuyên nghiệp, rõ ràng từng ý.
-    - PHẦN QUAN TRỌNG VỀ LINK: 
-       - Cuối câu trả lời, chỉ hiển thị một danh sách duy nhất các 'Link tài liệu tham khảo'.
-       - Tuyệt đối KHÔNG liệt kê lặp lại cùng một đường link.
-       - Nếu Link từ dữ liệu hệ thống và Link từ nội dung trực tiếp là một, chỉ được hiển thị 1 lần duy nhất.
+    YÊU CẦU TRẢ LỜI: 
+    1. Dựa vào 'NỘI DUNG CHI TIẾT', hãy trích xuất toàn bộ thông tin quan trọng:
+       - Giới thiệu công ty.
+       - Vị trí tuyển dụng & Yêu cầu kỹ năng (Hard/Soft skills).
+       - Quyền lợi (Lương, trợ cấp, môi trường).
+       - Cách thức ứng tuyển (Email, Quy trình).
+    2. Trình bày rõ ràng, gạch đầu dòng.
+    3. Nếu có link tài liệu gốc ({source_link}), HÃY ĐỂ NÓ Ở CUỐI CÙNG để người dùng tham khảo.
     """
     
-    print(f"--- DEBUG CONTEXT SENT TO AI ---\n{db_context}\n-------------------------------")
+    # 5. Gửi cho AI
+    try:
+        chat_session = start_chat_session()
+        answer = get_chat_response(chat_session, final_prompt)
+    except Exception as e:
+        answer = "⚠️ Hệ thống đang bận xử lý dữ liệu lớn. Vui lòng thử lại câu hỏi cụ thể hơn."
+        print(f"❌ Chat Error: {e}")
     
-    chat_session = start_chat_session()
-    return get_chat_response(chat_session, final_prompt), "Mode: Hybrid Real-time RAG"
+    print(f"⏱️ Total Time: {time.time() - t_start:.3f}s")
+    
+    # Đánh dấu mode để dễ debug
+    mode_label = "RAG Mode" if realtime_file_content else "RAG Fast Mode"
+    
+    return answer, mode_label
 
+# ==================== 6. ĐỒNG BỘ DỮ LIỆU (SYNC ALL) ====================
+
+def sync_all_data(force_reset=False):
+    print(f"🔄 [Sync] Bắt đầu đồng bộ dữ liệu (Local Embedding)...")
+    t_start = time.time()
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if force_reset:
+                    print("⚠️ [Reset] Đang xóa vector cũ...")
+                    tables = ["job_position", "company", "semester", "User", "major", "ojtdocument", "companydocument", "finalreport", "job_title_overview"]
+                    for t in tables:
+                        # Kiểm tra bảng tồn tại
+                        cur.execute(f"SELECT to_regclass('public.\"{t}\"');")
+                        if cur.fetchone()[0]:
+                            cur.execute(f'UPDATE "{t}" SET embedding = NULL, last_content_indexed = NULL;')
+                    conn.commit()
+
+                # --- ĐỊNH NGHĨA KỊCH BẢN (GIỐNG CŨ NHƯNG CHẠY LOCAL) ---
+                scenarios = [
+                    # 1. Job
+                    {"table": "job_position", "id": "job_position_id", "sql": """
+                        SELECT jp.job_position_id, 'VỊ TRÍ: ' || COALESCE(jp.job_title, '') || '. CÔNG TY: ' || COALESCE(c.name, 'N/A') || '. LƯƠNG: ' || COALESCE(jp.salary_range, '') || '. MÔ TẢ: ' || COALESCE(jd.job_description, '') || '. YÊU CẦU: ' || COALESCE(jp.requirements, '') as text 
+                        FROM job_position jp 
+                        LEFT JOIN semester_company sc ON jp.semester_company_id = sc.semester_company_id
+                        LEFT JOIN company c ON sc.company_id = c.company_id
+                        LEFT JOIN job_description jd ON jp.job_position_id = jd.job_position_id
+                    """},
+                    # 2. User
+                    {"table": "User", "id": "user_id", "sql": """
+                        SELECT u.user_id, 'NGƯỜI DÙNG: ' || COALESCE(u.fullname, '') || '. MSSV: ' || COALESCE(u.student_code, '') || '. EMAIL: ' || COALESCE(u.email, '') || '. NGÀNH: ' || COALESCE(m.major_title, '') || '. CÔNG TY: ' || COALESCE(c.name, '') as text
+                        FROM "User" u
+                        LEFT JOIN major m ON u.major_id = m.major_id
+                        LEFT JOIN company c ON u.company_id = c.company_id
+                    """},
+                    # 3. Docs (Có đọc file)
+                    {"table": "ojtdocument", "id": "ojtdocument_id", "sql": "SELECT ojtdocument_id, title, file_url FROM ojtdocument"},
+                    {"table": "companydocument", "id": "companydocument_id", "sql": """
+                        SELECT cd.companydocument_id, 'DOC CÔNG TY: ' || COALESCE(c.name, '') || '. TÊN: ' || COALESCE(cd.title, '') as text, cd.file_url 
+                        FROM companydocument cd LEFT JOIN semester_company sc ON cd.semester_company_id = sc.semester_company_id LEFT JOIN company c ON sc.company_id = c.company_id
+                    """},
+                    # 4. Các bảng đơn lẻ khác
+                    {"table": "company", "id": "company_id", "sql": "SELECT company_id, 'CÔNG TY: ' || COALESCE(name, '') || '. ĐỊA CHỈ: ' || COALESCE(address, '') || '. EMAIL: ' || COALESCE(contact_email, '') as text FROM company"},
+                    {"table": "semester", "id": "semester_id", "sql": "SELECT semester_id, 'HỌC KỲ: ' || COALESCE(name, '') || '. TỪ: ' || COALESCE(start_date::text, '') || ' ĐẾN: ' || COALESCE(end_date::text, '') as text FROM semester"},
+                    {"table": "major", "id": "major_id", "sql": "SELECT major_id, 'NGÀNH: ' || COALESCE(major_title, '') || '. MÔ TẢ: ' || COALESCE(description, '') as text FROM major"},
+                    {"table": "finalreport", "id": "finalreport_id", "sql": """
+                         SELECT fr.finalreport_id, 'ĐÁNH GIÁ: SV ' || COALESCE(u.fullname, '') || ' TẠI ' || COALESCE(c.name, '') || '. ĐIỂM: ' || COALESCE(fr.company_rating::text, '0') || '. NHẬN XÉT: ' || COALESCE(fr.company_feedback, '') as text
+                         FROM finalreport fr LEFT JOIN "User" u ON fr.user_id = u.user_id LEFT JOIN job_position jp ON fr.job_position_id = jp.job_position_id LEFT JOIN semester_company sc ON jp.semester_company_id = sc.semester_company_id LEFT JOIN company c ON sc.company_id = c.company_id
+                    """},
+                    {"table": "job_title_overview", "id": "job_title_id", "sql": "SELECT job_title_id, 'THỐNG KÊ VIỆC LÀM: ' || COALESCE(job_title, '') || '. SỐ LƯỢNG: ' || COALESCE(position_amount::text, '0') as text FROM job_title_overview"}
+                ]
+
+                # --- LOOP XỬ LÝ ---
+                for sc in scenarios:
+                    table = sc['table']
+                    id_col = sc['id']
+                    
+                    cur.execute(f"SELECT to_regclass('public.\"{table}\"');")
+                    if not cur.fetchone()[0]: continue
+
+                    # Lấy dữ liệu chưa index
+                    cur.execute(f"""
+                        WITH source AS ({sc['sql']})
+                        SELECT s.* FROM source s JOIN "{table}" t ON s.{id_col} = t."{id_col}"
+                        WHERE t.embedding IS NULL OR t.last_content_indexed IS NULL
+                    """)
+                    rows = cur.fetchall()
+                    if not rows: continue
+                    
+                    print(f"📦 [{table}] Xử lý {len(rows)} dòng mới.")
+                    BATCH_SIZE = 10
+                    
+                    for i in range(0, len(rows), BATCH_SIZE):
+                        batch = rows[i : i + BATCH_SIZE]
+                        batch_texts, batch_ids = [], []
+
+                        for r in batch:
+                            rid = r[0]
+                            # Xử lý File Drive
+                            if table in ["ojtdocument", "companydocument"]:
+                                title = r[1]
+                                url = r[2] if len(r) > 2 else ""
+                                content = ""
+                                if "drive.google.com" in url:
+                                    print(f"   📥 Đọc file: {title[:20]}...")
+                                    content = get_text_from_drive(url)
+                                final_text = f"{title}. CHI TIẾT: {content}. Link: {url}"
+                            else:
+                                final_text = r[1]
+                            
+                            batch_texts.append(final_text)
+                            batch_ids.append(rid)
+
+                        # Tạo Embedding LOCAL
+                        vectors = get_embeddings_batch(batch_texts)
+                        
+                        # Lưu vào DB
+                        if vectors:
+                            for idx, vec in enumerate(vectors):
+                                cur.execute(f'UPDATE "{table}" SET embedding = %s, last_content_indexed = %s WHERE "{id_col}" = %s', 
+                                            (vec, batch_texts[idx], batch_ids[idx]))
+                            conn.commit()
+                            print(f"   ✅ Saved batch {i//BATCH_SIZE + 1} (Local Vector).")
+
+        print(f"🎉 [Sync] Hoàn tất sau {time.time() - t_start:.2f}s.")
+    except Exception as e:
+        print(f"❌ Lỗi Sync: {e}")
+
+# ==================== 7. CV REVIEW (NÂNG CẤP) ====================
 
 def run_cv_review(cv_text: str, user_message: str):
-    from rag_core import start_chat_session
-    context = search_vectors(cv_text)
-    prompt = f"CV SINH VIÊN: {cv_text[:3000]}\n\nNGỮ CẢNH HỆ THỐNG: {context}\n\nYÊU CẦU: {user_message}\n\nHƯỚNG DẪN: Đánh giá độ phù hợp CV với Job và Quy định OJT."
-    return start_chat_session().send_message(prompt).text, "Mode: CV Reviewer Intelligence"
+    from rag_core import start_chat_session, get_chat_response
+    
+    # 1. Debug xem đã đọc được nội dung CV chưa
+    print(f"📄 [CV Review] Đã đọc được: {len(cv_text)} ký tự từ CV.")
+    if len(cv_text) < 100:
+        return "⚠️ Lỗi: Không đọc được nội dung CV (File có thể là ảnh scan hoặc bị lỗi font). Vui lòng thử file PDF khác.", "CV Error"
 
-def check_vector_coverage():
-    conn = psycopg2.connect(dsn=DB_DSN)
-    cur = conn.cursor()
-    for t in ["job_position", "ojtdocument", "User", "company"]:
-        cur.execute(f'SELECT COUNT(*), COUNT(embedding) FROM "{t}"')
-        total, has_v = cur.fetchone()
-        print(f"📊 {t}: {has_v}/{total} vectors.")
-    conn.close()
+    # 2. Tạo Search Query thông minh hơn
+    # Thay vì tìm nguyên văn cả CV, ta trích xuất 500 ký tự đầu (thường chứa Tech Stack) 
+    # và thêm từ khóa để ép Vector tìm về phía Job/Company thay vì tài liệu OJT.
+    search_query = cv_text[:500] + " Tìm việc làm phù hợp cho ứng viên dựa trên kỹ năng công nghệ và kinh nghiệm làm việc."
+    
+    # 3. Tìm kiếm Job trong DB
+    # (Lấy kết quả context từ hàm search_vectors có sẵn)
+    context = search_vectors(search_query)
+    
+    # 4. Prompt "Match Maker" (So khớp ứng viên & Việc làm)
+    prompt = f"""
+    VAI TRÒ: Bạn là chuyên gia HR. Nhiệm vụ là ghép đôi ứng viên với công việc phù hợp nhất.
+
+    DỮ LIỆU ĐẦU VÀO:
+    ----------------
+    1. HỒ SƠ ỨNG VIÊN (CV):
+    {cv_text[:3000]} ... (lược bớt)
+    
+    2. DANH SÁCH VIỆC LÀM TRONG HỆ THỐNG (Database):
+    {context}
+    
+    3. CÂU HỎI CỦA ỨNG VIÊN: "{user_message}"
+    ----------------
+    
+    YÊU CẦU PHÂN TÍCH:
+    1. BỎ QUA các tài liệu hướng dẫn OJT (File PDF quy định). Chỉ tập trung vào [VIỆC LÀM] hoặc [DOANH NGHIỆP].
+    2. Phân tích kỹ năng cứng (Hard Skills) trong CV (VD: Java, React, Python, SQL...).
+    3. So sánh với "Yêu cầu" (Requirements) của các Job tìm thấy.
+    4. Đưa ra Top 3 công ty/vị trí phù hợp nhất.
+    
+    ĐỊNH DẠNG TRẢ LỜI (Bắt buộc):
+    🎯 **Top 1: [Tên Vị Trí] - [Tên Công Ty]**
+       - 💡 Độ phù hợp: [Cao/Khá]
+       - ✅ Lý do match: [Kỹ năng nào trong CV khớp với Job?]
+       - ⚠️ Cần bổ sung: [Job yêu cầu gì mà CV chưa có?]
+
+    🎯 **Top 2: ...**
+    
+    (Nếu không tìm thấy Job nào phù hợp, hãy đưa ra lời khuyên cải thiện CV dựa trên thị trường).
+    """
+    
+    print("🤖 [CV Review] Đang phân tích độ phù hợp...")
+    return get_chat_response(start_chat_session(), prompt), "CV Reviewer Intelligence"

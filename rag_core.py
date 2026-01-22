@@ -3,276 +3,238 @@ import re
 import vertexai
 from vertexai.generative_models import GenerativeModel, ChatSession, Tool, Part, FunctionDeclaration
 from sqlalchemy import create_engine, text
-import agent_adk  # Import file chứa hàm tìm kiếm Vector
+from tenacity import retry, stop_after_attempt, wait_fixed
+import agent_adk  # Import file tìm kiếm Vector đã tối ưu trước đó
 
-# ==================== 1. CẤU HÌNH DATABASE (CODE CỦA BẠN) ====================
+# ==================== 1. CẤU HÌNH DATABASE (Lazy Loading) ====================
 
-# CẤU HÌNH CHO MÁY TÍNH CỦA BẠN (LOCAL)
+# Cấu hình URL
 LOCAL_DB_URL = "postgresql://postgres:123@caboose.proxy.rlwy.net:54173/railway"
+DB_URL = os.environ.get("DATABASE_URL", LOCAL_DB_URL)
 
-# LOGIC TỰ ĐỘNG CHỌN MÔI TRƯỜNG
-if "DATABASE_URL" in os.environ:
-    DB_URL = os.environ["DATABASE_URL"]
-    # Fix lỗi tương thích cho SQLAlchemy (postgres:// -> postgresql://)
-    if DB_URL.startswith("postgres://"):
-        DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
-    print("🌍 [CONFIG] Detected Cloud Environment (Railway). Using Internal DB.")
-else:
-    DB_URL = LOCAL_DB_URL
-    print("💻 [CONFIG] Detected Local Environment. Using Public DB.")
+# Fix lỗi tương thích SQLAlchemy trên Cloud
+if DB_URL.startswith("postgres://"):
+    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
 
-# Tạo engine kết nối
-try:
-    engine = create_engine(DB_URL, pool_size=10, pool_pre_ping=True)
-    print(f"🔌 Database Engine created successfully.")
-except Exception as e:
-    print(f"⚠️ Lỗi cấu hình Database: {e}")
+_db_engine = None
 
-_last_sql = "N/A"
+def get_engine():
+    """Tạo Engine kết nối DB theo cơ chế Singleton (Chỉ tạo 1 lần)"""
+    global _db_engine
+    if _db_engine is None:
+        try:
+            _db_engine = create_engine(
+                DB_URL, 
+                pool_size=10, 
+                pool_recycle=3600, 
+                pool_pre_ping=True # Tự động kết nối lại nếu bị ngắt
+            )
+            print("🔌 [DB] Database Engine initialized.")
+        except Exception as e:
+            print(f"⚠️ [DB] Connection Error: {e}")
+    return _db_engine
 
 def execute_sql(sql_query):
-    """
-    Hàm thực thi SQL an toàn, tự động sửa lỗi tên bảng User và log chi tiết.
-    """
-    global _last_sql
-    
-    # 1. Dọn dẹp markdown thừa từ AI
-    sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+    """Thực thi SQL an toàn, tự động fix lỗi tên bảng User"""
+    engine = get_engine()
+    if not engine: return "Lỗi kết nối Database."
 
-    # 2. Tự động sửa lỗi thiếu ngoặc kép cho bảng User
+    # 1. Dọn dẹp markdown
+    sql_query = re.sub(r"```sql|```", "", sql_query, flags=re.IGNORECASE).strip()
+    
+    # 2. Fix lỗi bảng "User" (Postgres case-sensitive)
     sql_query = re.sub(r'(?<!")\bUser\b(?!")', '"User"', sql_query, flags=re.IGNORECASE)
     
-    _last_sql = sql_query
-    print(f"⚡ [Running SQL]: {sql_query}") 
+    print(f"⚡ [SQL Exec]: {sql_query}")
 
     try:
         with engine.connect() as conn:
+            # Giới hạn chỉ đọc để an toàn (Optional)
+            if not sql_query.lower().startswith("select"):
+                return "Chỉ cho phép câu lệnh SELECT để tra cứu dữ liệu."
+
             result_proxy = conn.execute(text(sql_query))
             keys = result_proxy.keys()
             result = result_proxy.mappings().all()
             
             if not result:
-                print("⚠️ [SQL Result]: Empty (0 rows)")
-                return "Truy vấn thành công nhưng không tìm thấy dữ liệu nào phù hợp."
+                return "Không tìm thấy dữ liệu nào phù hợp trong Database."
             
+            # Format kết quả dạng text gọn gàng cho AI đọc
             rows = []
-            for row in result:
-                row_parts = []
-                for k in keys:
-                    val = row[k]
-                    if val is not None:
-                        row_parts.append(f"{k}: {val}")
-                row_str = " | ".join(row_parts)
+            for row in result[:10]: # Chỉ lấy 10 dòng đầu để tránh tràn context
+                row_str = " | ".join([f"{k}: {row[k]}" for k in keys if row[k] is not None])
                 rows.append(f"- {row_str}")
             
-            final_output = "\n".join(rows)
-            print(f"✅ [SQL Result]: Found {len(result)} rows.")
-            return final_output
+            return "\n".join(rows)
             
     except Exception as e:
-        error_msg = f"Lỗi thực thi SQL: {str(e)}"
-        print(f"❌ [SQL ERROR]: {error_msg}")
-        return error_msg
-
-def get_last_sql():
-    return _last_sql
-
-def clear_last_sql():
-    global _last_sql
-    _last_sql = "N/A"
+        error_msg = str(e)
+        print(f"❌ [SQL Error]: {error_msg}")
+        return f"Lỗi cú pháp SQL: {error_msg}"
 
 # ==================== 2. CẤU HÌNH VERTEX AI & TOOLS ====================
 
-# Cấu hình Project Google Cloud (Thay bằng Project ID thật của bạn nếu cần)
-PROJECT_ID = "reflecting-surf-477600-p4"  
-LOCATION = "europe-west4"
+PROJECT_ID = os.getenv("PROJECT_ID", "reflecting-surf-477600-p4")
+LOCATION = os.getenv("LOCATION", "us-central1") # Khuyên dùng us-central1 cho ổn định
 
 try:
     vertexai.init(project=PROJECT_ID, location=LOCATION)
-    print("✅ Vertex AI Initialized.")
+    print(f"✅ [Vertex AI] Connected: {PROJECT_ID}")
 except Exception as e:
-    print(f"❌ Vertex AI Init Error: {e}")
+    print(f"❌ [Vertex AI] Init Error: {e}")
 
-# --- ĐỊNH NGHĨA TOOLS CHO AI ---
+# --- ĐỊNH NGHĨA TOOLS ---
 
-# Tool 1: Tìm kiếm Vector (Semantic Search)
 search_vectors_func = FunctionDeclaration(
     name="search_vectors",
-    description="Tìm kiếm thông tin trong tài liệu, mô tả công việc, hoặc văn bản dài bằng ngữ nghĩa (Vector Search). Dùng khi câu hỏi mơ hồ, hỏi về mô tả, nội dung, yêu cầu...",
+    description="Tìm kiếm ngữ nghĩa (Semantic Search) trong tài liệu OJT, mô tả công việc, nội dung file PDF/Word. Dùng cho các câu hỏi: 'Quy định về...', 'Mô tả công việc...', 'Tìm tài liệu...'",
     parameters={
         "type": "object",
         "properties": {
-            "question": {
-                "type": "string",
-                "description": "Câu hỏi hoặc từ khóa cần tìm kiếm"
-            },
-            "target_table": {
-                "type": "string",
-                "description": "Bảng dữ liệu cần tìm (job_position, document, company, major, ...)"
-            }
+            "question": {"type": "string", "description": "Câu hỏi cần tìm kiếm"},
+            "limit": {"type": "integer", "description": "Số lượng kết quả (mặc định 5)"}
         },
         "required": ["question"]
     },
 )
 
-# Tool 2: Tạo SQL (Structured Query)
 generate_sql_func = FunctionDeclaration(
     name="generate_sql_query",
-    description="Truy vấn dữ liệu có cấu trúc chính xác (SQL). Dùng khi hỏi về địa chỉ, email, số điện thoại, ngày tháng, số lượng, danh sách cụ thể...",
+    description="Tra cứu dữ liệu chính xác bằng SQL. Dùng cho câu hỏi về: Số liệu, Danh sách sinh viên, Email, Số điện thoại, Lương cụ thể, Ngày tháng.",
     parameters={
         "type": "object",
         "properties": {
-            "question": {
-                "type": "string",
-                "description": "Câu hỏi gốc của người dùng để chuyển thành SQL"
-            }
+            "question": {"type": "string", "description": "Câu hỏi gốc cần chuyển thành SQL"}
         },
         "required": ["question"]
     },
 )
 
-# Gom nhóm Tools
-rag_tools = Tool(
-    function_declarations=[search_vectors_func, generate_sql_func],
-)
+rag_tools = Tool(function_declarations=[search_vectors_func, generate_sql_func])
+
 SYSTEM_INSTRUCTION = """
-BẠN LÀ: OJT INTELLIGENT AGENT (BILINGUAL & ROBUST)
+VAI TRÒ: OJT AI ASSISTANT (Thông minh - Trung thực - Dựa trên dữ liệu).
 
-QUY TẮC TỐI THƯỢNG:
-1. LUÔN LUÔN ưu tiên thông tin trong phần 'DỮ LIỆU HỆ THỐNG' được cung cấp kèm theo câu hỏi.
-2. NẾU DỮ LIỆU CÓ THÔNG TIN (Địa chỉ, Website, Lương, Kỹ năng), bạn PHẢI sử dụng chúng để trả lời. Tuyệt đối không được nói "không thấy" nếu dữ liệu thực tế đang hiển thị thông tin đó.
-3. LOẠI BỎ NHIỄU: Nếu trong dữ liệu trích xuất có chứa các thông báo lỗi kỹ thuật (ví dụ: "column... does not exist", "error", "undefined"), hãy BỎ QUA chúng và chỉ tập trung vào các dòng dữ liệu có ý nghĩa nhân văn (tên công ty, địa chỉ thật).
-
-NGUYÊN TẮC HOẠT ĐỘNG:
-1. ĐA NGÔN NGỮ: Phản hồi bằng ngôn ngữ người dùng hỏi (Hỏi Tiếng Việt trả lời Tiếng Việt).
-2. TRUNG THỰC & DỰA TRÊN DỮ LIỆU: 
-   - LUÔN LUÔN gọi công cụ 'search_vectors' cho MỌI câu hỏi có tính chất tra cứu.
-   - Chỉ khẳng định thông tin nếu tìm thấy trong kết quả từ 'search_vectors'.
-   - Nếu tìm thấy link (file_url) trong kết quả [TÀI LIỆU], hãy luôn đính kèm link đó để người dùng kiểm chứng.
-
-3. XỬ LÝ KHI THIẾU DỮ LIỆU (QUAN TRỌNG):
-   - Chỉ khi kết quả trả về thực sự trống rỗng hoặc "Không tìm thấy bất kỳ bản ghi nào...", bạn mới được trả lời: "Dạ, hiện tại hệ thống chưa có dữ liệu chính thức về vấn đề này."
-   - TUYỆT ĐỐI KHÔNG bịa ra quy định nếu không thấy trong bảng 'ojtdocument' hoặc 'job_position'.
-
-4. ĐỊNH NGHĨA CẤU TRÚC BẢNG ĐỂ TRUY VẤN:
-   - "semester": (semester_id, name, start_date, end_date, is_active).
-   - "major": (major_id, major_title, major_code).
-   - "company": (name, address, website, contact_email).
-   - "ojtdocument": (title, file_url). Đây là nguồn dữ liệu chính cho các quy định OJT.
-   - "job_position": (job_title, requirements, location, salary_range).
-
-5. MAPPING THÔNG MINH & SỬA LỖI:
-   - Tự động sửa lỗi chính tả người dùng (Sộp pe -> Shopee, Môm -> MoMo) trước khi tìm kiếm.
-   - Nếu tìm kiếm lần 1 thất bại, hãy thử lại với từ khóa ngắn gọn hơn.
-
-6. PHÂN BIỆT CHẾ ĐỘ:
-   - Nếu có file CV: So sánh kỹ năng trong CV với 'job_position' để tư vấn vị trí phù hợp.
-   - Nếu không có file: Tra cứu kiến thức quy định OJT và thông tin việc làm.
+1. ƯU TIÊN SỬ DỤNG TOOL:
+   - Nếu câu hỏi cần tra cứu quy định, tài liệu, mô tả: Gọi 'search_vectors'.
+   - Nếu câu hỏi cần danh sách, số liệu, thông tin cụ thể (Email, SĐT): Gọi 'generate_sql_query'.
+   
+2. NGUYÊN TẮC TRẢ LỜI:
+   - Chỉ trả lời dựa trên kết quả trả về từ Tool.
+   - Nếu có Link tài liệu (file_url), BẮT BUỘC phải đính kèm vào cuối câu trả lời.
+   - Nếu Tool trả về rỗng, hãy nói: "Hiện tại hệ thống chưa có thông tin về vấn đề này."
+   
+3. KHÔNG BỊA ĐẶT: Tuyệt đối không tự sáng tác quy định hoặc thông tin liên hệ.
 """
 
-# Khởi tạo Model với Tools
-model = GenerativeModel(
-    model_name="gemini-2.5-pro", # Hoặc pro
-    generation_config={
-        "temperature": 0.1, # Giữ mức thấp để câu trả lời chính xác
-        "top_p": 0.8,
-    },
-    system_instruction="Bạn là trợ lý ảo hỗ trợ học kỳ OJT. Hãy trả lời ngắn gọn, lịch sự dựa trên dữ liệu được cung cấp."
-    # BỎ PHẦN TOOLS TẠI ĐÂY
+# Model chính để Chat (Có khả năng gọi Tool)
+# Lưu ý: Vertex AI hỗ trợ tốt nhất function calling trên gemini-1.5-pro hoặc gemini-1.5-flash
+chat_model = GenerativeModel(
+    model_name="gemini-2.0-flash-001", # Flash nhanh và rẻ hơn, Pro thông minh hơn
+    generation_config={"temperature": 0.0}, # 0.0 để AI chọn Tool chính xác nhất
+    system_instruction=SYSTEM_INSTRUCTION,
+    tools=[rag_tools]
 )
 
-def start_chat_session():
-    """Khởi tạo phiên chat mới"""
-    return model.start_chat()
+# Model phụ chuyên viết SQL (Tách riêng để tối ưu Prompt)
+sql_gen_model = GenerativeModel(
+    model_name="gemini-2.0-flash-exp",
+    generation_config={"temperature": 0.0} # Bắt buộc 0.0 để SQL chuẩn xác
+)
 
-# ==================== 3. HÀM XỬ LÝ CHAT THÔNG MINH ====================
+DB_SCHEMA = """
+SCHEMA:
+- Company(company_id, name, address, website, contact_email)
+- Job_Position(job_title, requirements, salary_range, location, company_id)
+- "User"(fullname, email, student_code, role, major_id)
+- Major(major_title, major_code)
+- Semester(name, start_date, end_date)
+"""
+
+def generate_sql_helper(question):
+    """Hàm phụ trợ để sinh SQL từ câu hỏi"""
+    prompt = f"""
+    {DB_SCHEMA}
+    Yêu cầu: Viết câu lệnh PostgreSQL để trả lời: "{question}".
+    Quy tắc: 
+    1. Chỉ dùng SELECT. 
+    2. ILIKE cho tìm kiếm văn bản. 
+    3. Trả về duy nhất code SQL, không markdown.
+    4. Bảng User phải để trong ngoặc kép: "User".
+    """
+    try:
+        response = sql_gen_model.generate_content(prompt)
+        return response.text.strip()
+    except:
+        return ""
+
+# ==================== 3. LOGIC CHAT THÔNG MINH (LOOP) ====================
+
+def start_chat_session():
+    return chat_model.start_chat()
 
 def get_chat_response(chat_session: ChatSession, prompt: str):
-    """
-    Gửi tin nhắn cho Gemini và tự động xử lý vòng lặp Function Calling.
-    """
-    # Reset biến debug SQL cho request mới
-    clear_last_sql()
+    """Xử lý vòng lặp gọi Tool tự động"""
     
+    # Gửi tin nhắn đầu tiên
     try:
-        # 1. Gửi câu hỏi đầu tiên
         response = chat_session.send_message(prompt)
-        
-        # 2. Vòng lặp xử lý: Nếu AI muốn gọi hàm, ta thực thi và gửi lại kết quả
-        max_turns = 5
-        current_turn = 0
-
-        while current_turn < max_turns:
-            try:
-                # Kiểm tra an toàn xem có nội dung không
-                if not response.candidates or not response.candidates[0].content.parts:
-                    break
-                part = response.candidates[0].content.parts[0]
-            except:
-                break 
-
-            # === TRƯỜNG HỢP 1: AI MUỐN GỌI HÀM (Function Call) ===
-            if part.function_call:
-                func_name = part.function_call.name
-                func_args = dict(part.function_call.args)
-                
-                print(f"🔄 [AI Action] Calling function: {func_name} | Args: {func_args}")
-                
-                api_response = {}
-                
-                # Xử lý: search_vectors
-                if func_name == "search_vectors":
-                    # Gọi hàm từ agent_adk.py
-                    result = agent_adk.search_vectors(
-                        question=func_args.get("question"),
-                        target_table=func_args.get("target_table", "document")
-                    )
-                    api_response = {"result": result}
-                    
-                # Xử lý: generate_sql_query
-                elif func_name == "generate_sql_query":
-                    # Bước 1: Hỏi AI để lấy câu SQL (Prompt phụ)
-                    sql_gen_model = GenerativeModel("gemini-2.5-pro")
-                    # Schema rút gọn để AI hiểu cấu trúc DB
-                    db_schema = """
-                    Tables:
-                    - Company(company_id, name, address, website, email, phone, tax_code)
-                    - Job_Position(job_position_id, job_title, requirements, salary, location, company_id)
-                    - "User"(user_id, fullname, email, phone, address, role)
-                    - Semester(semester_id, semester_name, start_date, end_date)
-                    - Major(major_id, major_title, major_code)
-                    """
-                    sql_prompt = f"Bạn là chuyên gia SQL PostgreSQL. Dựa vào schema sau:\n{db_schema}\n\nHãy viết câu lệnh SQL để trả lời: '{func_args.get('question')}'. Chỉ trả về code SQL, không giải thích."
-                    
-                    try:
-                        sql_resp = sql_gen_model.generate_content(sql_prompt)
-                        generated_sql = sql_resp.text
-                        
-                        # Bước 2: Chạy SQL bằng hàm execute_sql ở trên
-                        sql_result = execute_sql(generated_sql)
-                        api_response = {"result": sql_result}
-                    except Exception as sqle:
-                        api_response = {"error": str(sqle)}
-                
-                else:
-                    api_response = {"error": "Unknown function"}
-
-                # Gửi kết quả chạy hàm NGƯỢC LẠI cho AI
-                response = chat_session.send_message(
-                    Part.from_function_response(
-                        name=func_name,
-                        response=api_response
-                    )
-                )
-                current_turn += 1
-                continue # Quay lại đầu vòng lặp
-
-            # === TRƯỜNG HỢP 2: AI TRẢ LỜI TEXT (Đã có kết quả) ===
-            else:
-                return response.text
-
-        return "Xin lỗi, hệ thống đang bận, vui lòng thử lại sau."
-
     except Exception as e:
-        print(f"❌ Lỗi xử lý chat: {e}")
-        return "Đã xảy ra lỗi trong quá trình xử lý yêu cầu."
+        return f"⚠️ Lỗi kết nối AI: {e}"
+
+    # Vòng lặp xử lý (Tối đa 5 lần gọi tool liên tiếp)
+    current_turn = 0
+    while current_turn < 5:
+        try:
+            # Kiểm tra xem AI có muốn gọi hàm không
+            if not response.candidates or not response.candidates[0].content.parts:
+                break
+            
+            part = response.candidates[0].content.parts[0]
+            
+            # Nếu là Text thường -> Trả về luôn
+            if not part.function_call:
+                return response.text
+            
+            # === AI MUỐN GỌI HÀM ===
+            func_name = part.function_call.name
+            args = dict(part.function_call.args)
+            print(f"🔧 [Tool Call] {func_name} | Args: {args}")
+            
+            api_result = {}
+            
+            # 1. Xử lý Vector Search
+            if func_name == "search_vectors":
+                q = args.get("question")
+                # Gọi hàm search_vectors đã tối ưu bên agent_adk
+                raw_res = agent_adk.search_vectors(q, limit=5)
+                api_result = {"result": raw_res}
+
+            # 2. Xử lý SQL Query
+            elif func_name == "generate_sql_query":
+                q = args.get("question")
+                generated_sql = generate_sql_helper(q) # Gọi AI viết SQL
+                if generated_sql:
+                    sql_res = execute_sql(generated_sql) # Chạy SQL
+                    api_result = {"sql": generated_sql, "data": sql_res}
+                else:
+                    api_result = {"error": "Không thể tạo câu lệnh SQL."}
+
+            else:
+                api_result = {"error": "Hàm không tồn tại."}
+
+            # Gửi kết quả Tool trở lại cho AI
+            response = chat_session.send_message(
+                Part.from_function_response(
+                    name=func_name,
+                    response=api_result
+                )
+            )
+            current_turn += 1
+            
+        except Exception as e:
+            print(f"❌ Error in chat loop: {e}")
+            return "Xin lỗi, đã xảy ra lỗi trong quá trình xử lý."
+
+    return response.text
