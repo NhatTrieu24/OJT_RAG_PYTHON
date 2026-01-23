@@ -252,19 +252,32 @@ def run_agent(question: str, file_content: str = None):
     return answer, mode_label
 
 # ==================== 6. ĐỒNG BỘ DỮ LIỆU (SYNC ALL) ====================
-
+SYNC_STATE = {
+    "is_running": False,
+    "step": "Sẵn sàng",
+    "detail": "",
+    "processed": 0,
+    "total_estimate": 0
+}
 def sync_all_data(force_reset=False):
-    print(f"🔄 [Sync] Bắt đầu đồng bộ dữ liệu (Local Embedding)...")
+    global SYNC_STATE
+    
+    print(f"🔄 [Sync] Bắt đầu đồng bộ dữ liệu...")
+    # Cập nhật trạng thái bắt đầu
+    SYNC_STATE["is_running"] = True
+    SYNC_STATE["step"] = "Đang khởi động..."
+    SYNC_STATE["processed"] = 0
+    
     t_start = time.time()
     
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 if force_reset:
+                    SYNC_STATE["step"] = "Đang xóa dữ liệu cũ (Reset)..."
                     print("⚠️ [Reset] Đang xóa vector cũ...")
                     tables = ["job_position", "company", "semester", "User", "major", "ojtdocument", "companydocument", "finalreport", "job_title_overview"]
                     for t in tables:
-                        # Kiểm tra bảng tồn tại
                         cur.execute(f"SELECT to_regclass('public.\"{t}\"');")
                         if cur.fetchone()[0]:
                             cur.execute(f'UPDATE "{t}" SET embedding = NULL, last_content_indexed = NULL;')
@@ -304,10 +317,14 @@ def sync_all_data(force_reset=False):
                     {"table": "job_title_overview", "id": "job_title_id", "sql": "SELECT job_title_id, 'THỐNG KÊ VIỆC LÀM: ' || COALESCE(job_title, '') || '. SỐ LƯỢNG: ' || COALESCE(position_amount::text, '0') as text FROM job_title_overview"}
                 ]
 
-                # --- LOOP XỬ LÝ ---
+
+                # --- LOOP XỬ LÝ (SỬA ĐOẠN NÀY ĐỂ BÁO CÁO TIẾN ĐỘ) ---
                 for sc in scenarios:
                     table = sc['table']
                     id_col = sc['id']
+                    
+                    # Update trạng thái: Đang quét bảng nào
+                    SYNC_STATE["step"] = f"Đang quét bảng: {table}"
                     
                     cur.execute(f"SELECT to_regclass('public.\"{table}\"');")
                     if not cur.fetchone()[0]: continue
@@ -319,6 +336,7 @@ def sync_all_data(force_reset=False):
                         WHERE t.embedding IS NULL OR t.last_content_indexed IS NULL
                     """)
                     rows = cur.fetchall()
+                    
                     if not rows: continue
                     
                     print(f"📦 [{table}] Xử lý {len(rows)} dòng mới.")
@@ -327,6 +345,11 @@ def sync_all_data(force_reset=False):
                     for i in range(0, len(rows), BATCH_SIZE):
                         batch = rows[i : i + BATCH_SIZE]
                         batch_texts, batch_ids = [], []
+                        
+                        # --- CẬP NHẬT TIẾN ĐỘ CHI TIẾT ---
+                        SYNC_STATE["step"] = f"Đang xử lý {table}"
+                        SYNC_STATE["detail"] = f"Batch {i//BATCH_SIZE + 1} ({len(batch)} dòng)"
+                        SYNC_STATE["processed"] += len(batch)
 
                         for r in batch:
                             rid = r[0]
@@ -336,6 +359,8 @@ def sync_all_data(force_reset=False):
                                 url = r[2] if len(r) > 2 else ""
                                 content = ""
                                 if "drive.google.com" in url:
+                                    # Báo cáo đang đọc file nào
+                                    SYNC_STATE["detail"] = f"Đang đọc file: {title[:15]}..."
                                     print(f"   📥 Đọc file: {title[:20]}...")
                                     content = get_text_from_drive(url)
                                 final_text = f"{title}. CHI TIẾT: {content}. Link: {url}"
@@ -354,45 +379,99 @@ def sync_all_data(force_reset=False):
                                 cur.execute(f'UPDATE "{table}" SET embedding = %s, last_content_indexed = %s WHERE "{id_col}" = %s', 
                                             (vec, batch_texts[idx], batch_ids[idx]))
                             conn.commit()
-                            print(f"   ✅ Saved batch {i//BATCH_SIZE + 1} (Local Vector).")
+                            print(f"   ✅ Saved batch {i//BATCH_SIZE + 1}.")
 
         print(f"🎉 [Sync] Hoàn tất sau {time.time() - t_start:.2f}s.")
+        SYNC_STATE["step"] = "Hoàn tất"
+        SYNC_STATE["detail"] = f"Tổng thời gian: {time.time() - t_start:.2f}s"
+        
     except Exception as e:
         print(f"❌ Lỗi Sync: {e}")
-
+        SYNC_STATE["step"] = "Lỗi"
+        SYNC_STATE["detail"] = str(e)
+    finally:
+        # Đợi 5s rồi tắt trạng thái running để FE kịp đọc thông báo "Hoàn tất"
+        time.sleep(5) 
+        SYNC_STATE["is_running"] = False
 # ==================== 7. CV REVIEW (MATCH MAKER) ====================
+
+# ==================== 7. CV REVIEW (PHIÊN BẢN CHUYÊN GIA CAO CẤP) ====================
 
 def run_cv_review(cv_text: str, user_message: str):
     from rag_core import start_chat_session, get_chat_response
     
-    # 1. Debug
-    print(f"📄 [CV Review] Length: {len(cv_text)} chars.")
+    # 1. Kiểm tra đầu vào
+    print(f"📄 [CV Review] Đang đọc CV: {len(cv_text)} ký tự.")
     if len(cv_text) < 100:
-        return "⚠️ Lỗi: Không đọc được CV (File ảnh hoặc lỗi).", "CV Error"
+        return "⚠️ Lỗi: Không đọc được nội dung CV (File ảnh hoặc lỗi font).", "CV Error"
 
-    # 2. Search Job
-    search_query = cv_text[:500] + " tuyển dụng việc làm kỹ năng"
-    context = search_vectors(search_query)
+    # 2. Tìm kiếm Job phù hợp trong DB
+    # Thêm từ khóa "JD" và "Mô tả công việc" để tìm đúng file tuyển dụng
+    search_query = cv_text[:500] + " tuyển dụng JD Job Description yêu cầu kỹ năng lập trình"
+    db_context = search_vectors(search_query)
     
-    # 3. Match Prompt
-    prompt = f"""
-    VAI TRÒ: Chuyên gia HR Tech.
+    # 3. --- TÍNH NĂNG MỚI: ĐỌC CHI TIẾT FILE JD (Real-time) ---
+    # Nếu Vector Search tìm thấy link Drive của JD, ta sẽ tải về đọc ngay lập tức
+    detailed_jds = ""
+    found_links = re.findall(r'https://drive\.google\.com/[^\s]+', db_context)
+    
+    # Chỉ đọc tối đa 2 file JD liên quan nhất để không bị quá tải
+    if found_links:
+        print(f"🚀 [CV Match] Phát hiện {len(found_links)} JD tiềm năng. Đang đọc chi tiết...")
+        unique_links = list(set(found_links))[:2] # Lấy 2 link đầu tiên (thường là match nhất)
+        
+        for idx, link in enumerate(unique_links):
+            link = link.rstrip(").,")
+            content = get_text_from_drive(link) # Hàm này đã có sẵn trong agent_adk.py
+            if content:
+                detailed_jds += f"\n--- CHI TIẾT JD SỐ {idx+1} ({link}) ---\n{content[:4000]}\n" # Cắt bớt nếu quá dài
+                print(f"   ✅ Đã đọc xong JD số {idx+1}")
+    else:
+        detailed_jds = "Không đọc được file chi tiết (Chỉ dùng tóm tắt hệ thống)."
 
+    # 4. Prompt Chuyên Gia Tuyển Dụng (Siêu chi tiết)
+    prompt = f"""
+    VAI TRÒ: Bạn là Chuyên gia Tuyển dụng (Senior Tech Recruiter) với 20 năm kinh nghiệm.
+    
     DỮ LIỆU ĐẦU VÀO:
-    1. CV ỨNG VIÊN: {cv_text[:3000]}
-    2. DANH SÁCH JOB: {context}
-    3. YÊU CẦU: "{user_message}"
+    --------------------------------------------------
+    1. HỒ SƠ ỨNG VIÊN (CV):
+    {cv_text[:3000]}
+    
+    2. DANH SÁCH VIỆC LÀM TÌM THẤY (Tóm tắt):
+    {db_context}
+    
+    3. NỘI DUNG JD ĐẦY ĐỦ (QUAN TRỌNG - Ưu tiên dùng thông tin này):
+    {detailed_jds}
+    
+    4. YÊU CẦU CỦA NGƯỜI DÙNG: "{user_message}"
+    --------------------------------------------------
     
     NHIỆM VỤ:
-    - BỎ QUA các file quy định OJT. Chỉ tập trung vào VIỆC LÀM.
-    - So sánh kỹ năng trong CV với Job.
-    - Đưa ra Top 3 Job phù hợp nhất.
+    Hãy đóng vai người Mentor, phân tích kỹ lưỡng sự phù hợp giữa CV và các vị trí tìm được.
+    Tuyệt đối KHÔNG trả lời chung chung. Phải đưa ra dẫn chứng cụ thể từ CV và JD.
     
-    ĐỊNH DẠNG:
-    🎯 **Top 1: [Vị Trí] - [Công Ty]**
-       - ✅ Lý do match: ...
-       - ⚠️ Cần bổ sung: ...
+    ĐỊNH DẠNG CÂU TRẢ LỜI (Bắt buộc tuân thủ):
+    
+    🌟 **ĐỀ XUẤT SỐ 1: [Tên Vị Trí] - [Tên Công Ty]**
+       * **🎯 Độ phù hợp:** [Điểm số/10] (Dựa trên kỹ năng khớp)
+       * **✅ Tại sao bạn phù hợp (Matching Points):**
+           - CV bạn có kỹ năng [A] khớp với yêu cầu [B] trong JD.
+           - Bạn đã làm đồ án [C] liên quan đến mảng [D] của công ty.
+       * **⚠️ Điểm còn thiếu (Gap Analysis):**
+           - Công ty yêu cầu [X] (có trong JD) nhưng CV bạn chưa thấy nhắc đến.
+           - Cần cải thiện thêm về [Kỹ năng mềm/Tiếng Anh] theo yêu cầu của họ.
+       * **🎁 Quyền lợi nổi bật (Nếu có trong JD):** [Lương/Trợ cấp/Môi trường...]
+       * **🔗 Link tài liệu:** [Link file Drive hoặc Email nếu có]
+
+    🌟 **ĐỀ XUẤT SỐ 2: ...** (Tương tự)
+
+    💡 **LỜI KHUYÊN TỔNG QUÁT:**
+    (Đưa ra 1 lời khuyên đắt giá để ứng viên cải thiện CV này tốt hơn).
     """
     
-    print("🤖 [CV Review] Matching...")
-    return get_chat_response(start_chat_session(), prompt), "CV Matcher"
+    print("🤖 [CV Review] Đang phân tích sâu...")
+    # Gọi AI trả lời
+    answer = get_chat_response(start_chat_session(), prompt)
+    
+    return answer, "CV Matcher"
