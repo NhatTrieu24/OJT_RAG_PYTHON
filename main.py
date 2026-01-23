@@ -7,14 +7,27 @@ import uvicorn
 import vertexai
 import psycopg2
 import fitz  # PyMuPDF (Chuyên trị PDF)
+import json
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from apscheduler.schedulers.background import BackgroundScheduler
+gcp_json_content = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
 
+if gcp_json_content:
+    # Nếu biến này chứa nội dung JSON (bắt đầu bằng {), ta ghi nó ra file
+    if gcp_json_content.strip().startswith("{"):
+        print("🔑 [Auth] Phát hiện JSON Content từ Env Var. Đang tạo file tạm...")
+        cred_path = "google_creds.json"
+        with open(cred_path, "w") as f:
+            f.write(gcp_json_content)
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.abspath(cred_path)
+    # Nếu nó là đường dẫn file
+    else:
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = gcp_json_content
 # Import logic từ agent_adk
-from agent_adk import run_agent, run_cv_review, sync_all_data
+from agent_adk import run_agent, run_cv_review, sync_all_data,SYNC_STATE
 
 # ==================== CẤU HÌNH HỆ THỐNG ====================
 PROJECT_ID = os.environ.get("PROJECT_ID", "reflecting-surf-477600-p4")
@@ -188,7 +201,44 @@ async def sync_now(background_tasks: BackgroundTasks, force: bool = False):
 
 @app.get("/SyncStatus")
 async def get_sync_status():
-    return sync_status
+    """API trả về tiến độ Real-time cho Frontend"""
+    
+    # 1. Lấy thông tin Text (Đang làm gì) từ agent_adk
+    response = {
+        "is_running": SYNC_STATE["is_running"],
+        "step": SYNC_STATE["step"],       # VD: "Đang xử lý ojtdocument"
+        "detail": SYNC_STATE["detail"],   # VD: "Đang đọc file: Report.pdf..."
+        "progress_text": "0/0",
+        "percentage": 0
+    }
+
+    # 2. Lấy con số thống kê thực tế từ DB (Để vẽ thanh % chính xác)
+    try:
+        conn = psycopg2.connect(dsn=DB_DSN)
+        cur = conn.cursor()
+        # Đếm tổng số dòng đã Index vs Tổng số dòng
+        cur.execute("""
+            SELECT SUM(idx), SUM(cnt) FROM (
+                SELECT COUNT(embedding) as idx, COUNT(*) as cnt FROM ojtdocument
+                UNION ALL SELECT COUNT(embedding), COUNT(*) FROM job_position
+                UNION ALL SELECT COUNT(embedding), COUNT(*) FROM company
+                UNION ALL SELECT COUNT(embedding), COUNT(*) FROM "User"
+            ) as s
+        """)
+        indexed, total = cur.fetchone()
+        conn.close()
+
+        total = total if total else 1
+        indexed = indexed if indexed else 0
+        
+        response["progress_text"] = f"{indexed}/{total}"
+        response["percentage"] = round((indexed / total) * 100, 1)
+
+    except Exception:
+        # Nếu lỗi kết nối DB thì trả về số liệu tạm
+        response["progress_text"] = "Checking..."
+    
+    return response
 
 @app.get("/list_files")
 async def list_files():
